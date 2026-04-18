@@ -1,0 +1,101 @@
+{
+  "image_path": "C:\\Users\\dnsxo\\Downloads\\DJMAXUI_AP_MX.png",
+  "ocr_settings": {
+    "min_confidence": 0.0,
+    "grayscale": false,
+    "threshold": false,
+    "threshold_value": 140
+  },
+  "monitor_settings": {
+    "trigger_box_name": "F5",
+    "template_path": "C:/Users/dnsxo/Downloads/MAXOCR/trigger.png",
+    "output_dir": "C:\\Users\\dnsxo\\Downloads\\MAXOCR\\output",
+    "interval_ms": 500,
+    "match_threshold": 0.9,
+    "numeric_box_names": [
+      "Score",
+      "CLASS_NUM",
+      "BREAK",
+      "Button"
+    ],
+    "overlay_timeout_seconds": 10,
+    "message_overlay_timeout_seconds": 1,
+    "compare_button_record": true,
+    "save_screenshot": false,
+    "pause_after_detection": true,
+    "include_trigger_box_in_ocr": false,
+    "score_outline_ocr": false
+  },
+  "manual_boxes": [
+    {
+      "name": "Title",
+      "x1": 1030,
+      "y1": 15,
+      "x2": 1721,
+      "y2": 65
+    },
+    {
+      "name": "CLASS_NUM",
+      "x1": 2091,
+      "y1": 740,
+      "x2": 2279,
+      "y2": 792
+    },
+    {
+      "name": "Class_title",
+      "x1": 2090,
+      "y1": 708,
+      "x2": 2436,
+      "y2": 750
+    },
+    {
+      "name": "Class_UP",
+      "x1": 2347,
+      "y1": 746,
+      "x2": 2462,
+      "y2": 787
+    },
+    {
+      "name": "F5",
+      "x1": 1965,
+      "y1": 1380,
+      "x2": 1987,
+      "y2": 1406
+    },
+    {
+      "name": "Score",
+      "x1": 1008,
+      "y1": 952,
+      "x2": 1561,
+      "y2": 1070
+    },
+    {
+      "name": "BREAK",
+      "x1": 1438,
+      "y1": 212,
+      "x2": 1571,
+      "y2": 279
+    },
+    {
+      "name": "Button",
+      "x1": 92,
+      "y1": 40,
+      "x2": 179,
+      "y2": 133
+    },
+    {
+      "name": "difficult",
+      "x1": 939,
+      "y1": 108,
+      "x2": 1075,
+      "y2": 149
+    },
+    {
+      "name": "ARTIST",
+      "x1": 1029,
+      "y1": 66,
+      "x2": 1720,
+      "y2": 99
+    }
+  ]
+}

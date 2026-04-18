@@ -8,8 +8,8 @@
   },
   "monitor_settings": {
     "trigger_box_name": "F5",
-    "template_path": "C:/Users/dnsxo/Downloads/MAXOCR/trigger.png",
-    "output_dir": "C:\\Users\\dnsxo\\Downloads\\MAXOCR\\output",
+    "template_path": "",
+    "output_dir": "",
     "interval_ms": 500,
     "match_threshold": 0.9,
     "numeric_box_names": [

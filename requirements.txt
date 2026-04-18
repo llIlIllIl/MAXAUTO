@@ -1,0 +1,8 @@
+Pillow==12.0.0
+numpy==2.3.5
+paddleocr==3.4.1
+paddlepaddle==3.2.2
+paddlex==3.4.3
+opencv-python==4.11.0.86
+PyQt6
+keyboard

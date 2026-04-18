@@ -9,5 +9,5 @@ main_old2.py
 main_old.py
 main.py
 /Debug
-*.txt
 /__pycache__
+account.txt

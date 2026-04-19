@@ -1,5 +1,6 @@
 # MAXAUTO
-V-ARCHIVE 사이트에 현재 기록을 자동으로 등록하는 프로그램입니다.
+V-ARCHIVE 사이트에 현재 기록을 자동으로 등록하는 프로그램입니다.<br>
+코드 제작에 AI가 사용되었습니다.<br>
 
 ![Demo](Demo.png)
 

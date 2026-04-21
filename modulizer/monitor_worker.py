@@ -94,12 +94,12 @@ class MonitorWorker(threading.Thread):
 
     def _handle_detection(self, screenshot: Image.Image, trigger_box: BoxRegion, score: float) -> None:
         monitor = self.config.monitor_settings
-        output_dir = Path(monitor.output_dir).expanduser()
-        output_dir.mkdir(parents=True, exist_ok=True)
-
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         screenshot_path = ""
+        text_path = ""
         if monitor.save_screenshot:
+            output_dir = Path(monitor.output_dir).expanduser()
+            output_dir.mkdir(parents=True, exist_ok=True)
             screenshot_path = str(output_dir / f"capture_{timestamp}.png")
             screenshot.save(screenshot_path)
 
@@ -114,16 +114,19 @@ class MonitorWorker(threading.Thread):
         )
         self._resolve_title_result(results)
 
-        text_path = output_dir / f"ocr_{timestamp}.txt"
-        self._write_text_report(text_path, screenshot, trigger_box, score, screenshot_path, results)
+        if monitor.save_screenshot:
+            report_path = Path(screenshot_path).with_name(f"ocr_{timestamp}.txt")
+            self._write_text_report(report_path, screenshot, trigger_box, score, screenshot_path, results)
+            text_path = str(report_path)
         self.event_queue.put(
             {
                 "type": "detected",
                 "score": score,
                 "timestamp": timestamp,
                 "trigger_box_name": trigger_box.name,
-                "text_path": str(text_path),
+                "text_path": text_path,
                 "screenshot_path": screenshot_path,
+                "pause_after_detection": monitor.pause_after_detection,
                 "results": results,
                 "debug_crops": self._make_debug_crops(screenshot, ("Title", "BREAK", "Score")),
             }
@@ -170,7 +173,7 @@ class MonitorWorker(threading.Thread):
             f"screen_size: {screenshot.size[0]}x{screenshot.size[1]}",
             f"trigger_box: {trigger_box.name} ({trigger_box.x1},{trigger_box.y1},{trigger_box.x2},{trigger_box.y2})",
             f"trigger_score: {score:.4f}",
-            f"screenshot: {screenshot_path or '(not saved)'}",
+            f"screenshot: {Path(screenshot_path).name if screenshot_path else '(not saved)'}",
             "",
         ]
         for item in results:

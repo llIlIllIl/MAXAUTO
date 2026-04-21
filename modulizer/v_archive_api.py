@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
@@ -14,7 +15,9 @@ from .record_store import fc_from_break, parse_score
 
 
 API_BASE_URL = "https://v-archive.net/client/open"
+RECORD_API_BASE_URL = "https://v-archive.net/api/v2/archive"
 ACCOUNT_PATH = APP_DIR / "account.txt"
+RECORD_BUTTONS = (4, 5, 6, 8)
 PATTERN_MAP = {
     "NM": "NORMAL",
     "NORMAL": "NORMAL",
@@ -43,6 +46,15 @@ class ScoreApiResult:
     request_payload: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ArchiveButtonRecordsResult:
+    button: int
+    nickname: str
+    count: int
+    records: dict[str, dict[str, dict[str, int]]]
+    payload: dict[str, Any]
+
+
 class VArchiveScoreClient:
     def __init__(self, account_path: Path = ACCOUNT_PATH, timeout_seconds: float = 10.0) -> None:
         self.account_path = Path(account_path)
@@ -60,7 +72,7 @@ class VArchiveScoreClient:
 
     def load_credentials(self) -> AccountCredentials:
         if not self.account_path.exists():
-            raise RuntimeError(f"account.txt 파일을 찾을 수 없습니다: {self.account_path}")
+            raise RuntimeError("account.txt 파일을 찾을 수 없습니다.")
         text = self.account_path.read_text(encoding="utf-8-sig").strip()
         parts = text.split()
         if len(parts) < 2:
@@ -91,6 +103,67 @@ class VArchiveScoreClient:
             raise RuntimeError(f"API 요청 실패: {exc.reason}") from exc
 
         return result_from_response(status_code, response_payload, payload)
+
+
+class VArchiveRecordClient:
+    def __init__(self, timeout_seconds: float = 10.0) -> None:
+        self.timeout_seconds = float(timeout_seconds)
+
+    def fetch_all(
+        self,
+        nickname: str,
+        buttons: tuple[int, ...] = RECORD_BUTTONS,
+    ) -> list[ArchiveButtonRecordsResult]:
+        clean_nickname = compact_value(nickname)
+        if not clean_nickname:
+            raise ValueError("유저 닉네임을 입력하세요.")
+        return [self.fetch_button(clean_nickname, button) for button in buttons]
+
+    def fetch_button(self, nickname: str, button: int) -> ArchiveButtonRecordsResult:
+        if button not in RECORD_BUTTONS:
+            raise ValueError(f"button 값은 4, 5, 6, 8 중 하나여야 합니다: {button}")
+        encoded_nickname = urllib.parse.quote(compact_value(nickname), safe="")
+        url = f"{RECORD_API_BASE_URL}/{encoded_nickname}/button/{button}"
+        request = urllib.request.Request(
+            url,
+            method="GET",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                status_code = int(response.status)
+                response_payload = decode_json_response(response.read())
+        except urllib.error.HTTPError as exc:
+            status_code = int(exc.code)
+            response_payload = decode_json_response(exc.read())
+            raise RuntimeError(record_response_message(status_code, response_payload)) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"기록 조회 API 요청 실패: {exc.reason}") from exc
+
+        if not (200 <= status_code < 300) or not bool(response_payload.get("success")):
+            raise RuntimeError(record_response_message(status_code, response_payload))
+
+        records_raw = response_payload.get("records", [])
+        if not isinstance(records_raw, list):
+            raise RuntimeError("기록 조회 API 응답 형식이 올바르지 않습니다.")
+
+        count_raw = response_payload.get("count", len(records_raw))
+        try:
+            count = int(count_raw)
+        except (TypeError, ValueError):
+            count = len(records_raw)
+
+        return ArchiveButtonRecordsResult(
+            button=button,
+            nickname=str(response_payload.get("nickname") or nickname),
+            count=count,
+            records=archive_records_to_local(records_raw),
+            payload=response_payload,
+        )
 
 
 def build_score_payload(values: dict[str, str]) -> dict[str, Any]:
@@ -138,6 +211,40 @@ def score_to_accuracy(score: int) -> float:
     return float(accuracy)
 
 
+def archive_records_to_local(records_raw: list[Any]) -> dict[str, dict[str, dict[str, int]]]:
+    records: dict[str, dict[str, dict[str, int]]] = {}
+    for record_raw in records_raw:
+        if not isinstance(record_raw, dict):
+            continue
+        pattern = compact_value(record_raw.get("pattern", "")).upper()
+        title = compact_value(record_raw.get("name", ""))
+        if not pattern or not title:
+            continue
+        try:
+            score = score_accuracy_to_points(record_raw.get("score"))
+        except (TypeError, ValueError):
+            continue
+        fc = 1 if bool(record_raw.get("maxCombo")) else 0
+        pattern_records = records.setdefault(pattern, {})
+        previous = pattern_records.get(title)
+        if previous is None:
+            pattern_records[title] = {"Score": score, "FC": fc}
+            continue
+        pattern_records[title] = {
+            "Score": max(int(previous.get("Score", 0)), score),
+            "FC": 1 if int(previous.get("FC", 0)) == 1 or fc == 1 else 0,
+        }
+    return records
+
+
+def score_accuracy_to_points(value: Any) -> int:
+    if value is None:
+        raise ValueError("score 값이 비어 있습니다.")
+    score = Decimal(str(value))
+    points = (score * Decimal("10000")).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return max(0, min(1_000_000, int(points)))
+
+
 def decode_json_response(raw: bytes) -> dict[str, Any]:
     if not raw:
         return {}
@@ -147,6 +254,18 @@ def decode_json_response(raw: bytes) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {"message": text}
     return data if isinstance(data, dict) else {"data": data}
+
+
+def record_response_message(status_code: int, response_payload: dict[str, Any]) -> str:
+    error_code = response_payload.get("errorCode")
+    fallback = response_payload.get("message")
+    if status_code == 404 and error_code == 101:
+        return "유저를 찾을 수 없습니다."
+    if status_code == 400:
+        return str(fallback) if fallback else "기록 조회 API 요청 값이 올바르지 않습니다."
+    if status_code == 500 or error_code == 999:
+        return str(fallback) if fallback else "기록 조회 API 서버 오류입니다."
+    return str(fallback) if fallback else f"기록 조회 API 요청 실패: HTTP {status_code}"
 
 
 def result_from_response(

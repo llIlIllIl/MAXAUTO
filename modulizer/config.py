@@ -62,6 +62,7 @@ class MonitorSettings:
     pause_after_detection: bool = True
     include_trigger_box_in_ocr: bool = False
     score_outline_ocr: bool = True
+    record_import_nickname: str = ""
 
 
 @dataclass
@@ -135,6 +136,7 @@ class ConfigStore:
                 pause_after_detection=bool(monitor_raw.get("pause_after_detection", True)),
                 include_trigger_box_in_ocr=bool(monitor_raw.get("include_trigger_box_in_ocr", False)),
                 score_outline_ocr=bool(monitor_raw.get("score_outline_ocr", True)),
+                record_import_nickname=str(monitor_raw.get("record_import_nickname", "")).strip(),
             ),
             manual_boxes=boxes,
         )

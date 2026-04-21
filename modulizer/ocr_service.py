@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import traceback
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -8,9 +9,16 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 from .boxes import BoxRegion
 from .config import OCRSettings
-from .constants import PADDLE_OCR_LANG, RESAMPLE_LANCZOS
+from .constants import (
+    PADDLE_OCR_DET_MODEL_NAME,
+    PADDLE_OCR_LANG,
+    PADDLE_OCR_MODEL_CACHE_DIR,
+    PADDLE_OCR_REC_MODEL_NAME,
+    RESAMPLE_LANCZOS,
+)
 
 PaddleOCRClass: Any | None = None
+REQUIRED_MODEL_FILES = ("config.json", "inference.json", "inference.pdiparams", "inference.yml")
 
 try:
     import numpy as np
@@ -29,8 +37,23 @@ class OCRService:
             self._engine = None
         self.settings = settings
 
-    def prepare_model(self) -> None:
+    def prepare_model(self) -> bool:
+        missing_before = self.missing_required_model_names()
         self._get_engine()
+        return bool(missing_before)
+
+    @classmethod
+    def missing_required_model_names(cls) -> list[str]:
+        return [
+            model_name
+            for model_name in (PADDLE_OCR_DET_MODEL_NAME, PADDLE_OCR_REC_MODEL_NAME)
+            if not cls._is_model_ready(model_name)
+        ]
+
+    @staticmethod
+    def _is_model_ready(model_name: str) -> bool:
+        model_dir = PADDLE_OCR_MODEL_CACHE_DIR / model_name
+        return model_dir.is_dir() and all((model_dir / filename).is_file() for filename in REQUIRED_MODEL_FILES)
 
     def preprocess(self, image: Image.Image, mode: str = "default") -> Image.Image:
         if mode == "break_outline":
@@ -136,7 +159,8 @@ class OCRService:
 
         try:
             engine = paddle_ocr(
-                lang=PADDLE_OCR_LANG,
+                text_detection_model_name=PADDLE_OCR_DET_MODEL_NAME,
+                text_recognition_model_name=PADDLE_OCR_REC_MODEL_NAME,
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=False,
@@ -146,8 +170,24 @@ class OCRService:
                 lang=PADDLE_OCR_LANG,
                 use_angle_cls=False,
             )
+        except Exception as exc:
+            raise RuntimeError(self._format_engine_error(exc)) from exc
         self._engine = engine
         return engine
+
+    @staticmethod
+    def _format_engine_error(exc: BaseException) -> str:
+        messages = [str(exc).strip() or exc.__class__.__name__]
+        cause = exc.__cause__ or exc.__context__
+        while cause is not None:
+            text = str(cause).strip() or cause.__class__.__name__
+            messages.append(f"{cause.__class__.__name__}: {text}")
+            cause = cause.__cause__ or cause.__context__
+        detail = " / ".join(message for message in messages if message)
+        traceback_tail = "".join(traceback.format_exception_only(exc.__class__, exc)).strip()
+        if traceback_tail and traceback_tail not in detail:
+            detail = f"{detail} / {traceback_tail}"
+        return f"PaddleOCR 한국어 모델 초기화 실패: {detail}"
 
     @staticmethod
     def _get_paddle_ocr_class() -> Any:

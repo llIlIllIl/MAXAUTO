@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
+import re
 import threading
 import unicodedata
 from datetime import datetime
@@ -38,7 +40,10 @@ from .monitor_worker import MonitorWorker
 from .ocr_service import OCRService
 from .overlays import ManualOverlayInputDialog, MessageOverlay, RegistrationOverlay
 from .record_store import ButtonRecordStore
-from .v_archive_api import ScoreApiResult, VArchiveScoreClient
+from .v_archive_api import ScoreApiResult, VArchiveRecordClient, VArchiveScoreClient
+
+
+STEAM_GAME_URL = "steam://rungameid/960170"
 
 
 class MainApp:
@@ -52,6 +57,7 @@ class MainApp:
         self.config = AppConfig()
         self.record_store = ButtonRecordStore()
         self.score_client = VArchiveScoreClient()
+        self.record_client = VArchiveRecordClient()
         self.image: Image.Image | None = None
         self.display_photo: ImageTk.PhotoImage | None = None
         self.scale_ratio = 1.0
@@ -75,10 +81,13 @@ class MainApp:
         self.registration_overlay: RegistrationOverlay | None = None
         self.message_overlay: MessageOverlay | None = None
         self.message_overlay_close_log: str | None = None
+        self.message_overlay_resume_on_close = True
         self.current_overlay_event: dict[str, Any] | None = None
         self.overlay_rerecognition_running = False
         self.manual_overlay_open = False
         self.ocr_model_thread: threading.Thread | None = None
+        self.record_import_thread: threading.Thread | None = None
+        self.record_import_button: ttk.Button | None = None
 
         self.vars = self._create_vars()
         self.box_edit_vars = self._create_box_edit_vars()
@@ -109,6 +118,7 @@ class MainApp:
             "pause_after_detection": tk.BooleanVar(value=True),
             "include_trigger_box_in_ocr": tk.BooleanVar(value=False),
             "score_outline_ocr": tk.BooleanVar(value=True),
+            "record_import_nickname": tk.StringVar(value=""),
             "status": tk.StringVar(value="대기"),
             "score": tk.StringVar(value="-"),
         }
@@ -198,6 +208,7 @@ class MainApp:
         controls = ttk.Frame(frame)
         controls.pack(fill=tk.X)
         ttk.Button(controls, text="시작", command=self.start_monitor).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(controls, text="게임과 함께 시작", command=self.start_monitor_with_game).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(controls, text="중지", command=self.stop_monitor).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(controls, text="Enter 재개", command=self.resume_monitor).pack(side=tk.LEFT)
 
@@ -252,6 +263,23 @@ class MainApp:
         row += 1
         ttk.Label(frame, text="숫자 박스").grid(row=row, column=0, sticky="w", pady=3)
         ttk.Entry(frame, textvariable=self.vars["numeric_box_names"]).grid(row=row, column=1, columnspan=2, sticky="ew", pady=3)
+
+        row += 1
+        ttk.Label(frame, text="유저 닉네임").grid(row=row, column=0, sticky="w", pady=3)
+        import_frame = ttk.Frame(frame)
+        import_frame.grid(row=row, column=1, columnspan=2, sticky="ew", pady=3)
+        ttk.Entry(import_frame, textvariable=self.vars["record_import_nickname"]).pack(
+            side=tk.LEFT,
+            fill=tk.X,
+            expand=True,
+        )
+        self.record_import_button = ttk.Button(
+            import_frame,
+            text="기록 가져오기",
+            command=self.start_record_import,
+        )
+        self.record_import_button.pack(side=tk.LEFT, padx=(6, 0))
+        import_frame.columnconfigure(0, weight=1)
 
         row += 1
         ttk.Label(frame, text="점수반영 오버레이 시간(초)").grid(row=row, column=0, sticky="w", pady=3)
@@ -332,13 +360,26 @@ class MainApp:
         settings = self.config.ocr_settings
 
         def worker() -> None:
-            self.event_queue.put({"type": "status", "message": "PaddleOCR Korean model preparing"})
+            missing_models = OCRService.missing_required_model_names()
+            if missing_models:
+                self.event_queue.put(
+                    {
+                        "type": "status",
+                        "message": f"PaddleOCR 한국어 모델 다운로드 중: {', '.join(missing_models)}",
+                    }
+                )
+            else:
+                self.event_queue.put({"type": "status", "message": "PaddleOCR 한국어 모델 준비 중"})
             try:
-                OCRService(settings).prepare_model()
+                downloaded = OCRService(settings).prepare_model()
             except Exception as exc:
-                self.event_queue.put({"type": "error", "message": f"PaddleOCR Korean model failed: {exc}"})
+                self.event_queue.put({"type": "error", "message": f"PaddleOCR 한국어 모델 준비 실패: {exc}"})
                 return
-            self.event_queue.put({"type": "status", "message": "PaddleOCR Korean model ready"})
+            if downloaded:
+                message = "PaddleOCR 한국어 모델 다운로드 및 준비 완료"
+            else:
+                message = "PaddleOCR 한국어 모델 준비 완료"
+            self.event_queue.put({"type": "status", "message": message})
 
         self.ocr_model_thread = threading.Thread(target=worker, daemon=True)
         self.ocr_model_thread.start()
@@ -347,7 +388,7 @@ class MainApp:
         if DEFAULT_CONFIG_PATH.exists():
             try:
                 self.apply_config(ConfigStore.load(DEFAULT_CONFIG_PATH))
-                self.append_log(f"기본 설정 불러옴: {DEFAULT_CONFIG_PATH}")
+                self.append_log(f"기본 설정 불러옴: {DEFAULT_CONFIG_PATH.name}")
                 return
             except Exception as exc:
                 self.append_log(f"기본 설정 불러오기 실패: {exc}")
@@ -377,6 +418,7 @@ class MainApp:
                 pause_after_detection=bool(self.vars["pause_after_detection"].get()),
                 include_trigger_box_in_ocr=bool(self.vars["include_trigger_box_in_ocr"].get()),
                 score_outline_ocr=bool(self.vars["score_outline_ocr"].get()),
+                record_import_nickname=str(self.vars["record_import_nickname"].get()).strip(),
             ),
             manual_boxes=[box.normalized() for box in self.config.manual_boxes],
         )
@@ -401,6 +443,7 @@ class MainApp:
         self.vars["pause_after_detection"].set(monitor.pause_after_detection)
         self.vars["include_trigger_box_in_ocr"].set(monitor.include_trigger_box_in_ocr)
         self.vars["score_outline_ocr"].set(monitor.score_outline_ocr)
+        self.vars["record_import_nickname"].set(monitor.record_import_nickname)
 
     def apply_config(self, config: AppConfig) -> None:
         self.config = config
@@ -428,13 +471,13 @@ class MainApp:
             self.image = None
             self.config.image_path = path
             if not silent:
-                messagebox.showwarning("이미지 없음", f"이미지를 찾을 수 없습니다.\n{path}")
+                messagebox.showwarning("이미지 없음", f"이미지를 찾을 수 없습니다.\n{image_path.name or path}")
             self.redraw_canvas()
             return
         try:
             self.image = Image.open(image_path).convert("RGB")
             self.config.image_path = str(image_path)
-            self.append_log(f"이미지 열기: {image_path}")
+            self.append_log(f"이미지 열기: {image_path.name}")
             self.redraw_canvas()
         except Exception as exc:
             if not silent:
@@ -450,7 +493,7 @@ class MainApp:
             return
         try:
             self.apply_config(ConfigStore.load(Path(path)))
-            self.append_log(f"설정 불러옴: {path}")
+            self.append_log(f"설정 불러옴: {Path(path).name}")
         except Exception as exc:
             messagebox.showerror("설정 오류", str(exc))
 
@@ -467,7 +510,7 @@ class MainApp:
         try:
             self.config = self.make_config_from_vars()
             ConfigStore.save(Path(path), self.config)
-            self.append_log(f"설정 저장됨: {path}")
+            self.append_log(f"설정 저장됨: {Path(path).name}")
         except Exception as exc:
             messagebox.showerror("저장 오류", str(exc))
 
@@ -484,6 +527,60 @@ class MainApp:
         path = filedialog.askdirectory(title="저장 폴더", initialdir=str(APP_DIR))
         if path:
             self.vars["output_dir"].set(path)
+
+    def start_record_import(self) -> None:
+        if self.record_import_thread is not None and self.record_import_thread.is_alive():
+            return
+        nickname = str(self.vars["record_import_nickname"].get()).strip()
+        if not nickname:
+            messagebox.showwarning("닉네임 필요", "기록을 가져올 유저 닉네임을 입력하세요.")
+            return
+        if not messagebox.askyesno(
+            "기록 가져오기 확인",
+            "기존에 존재하는 내역이 전부 삭제됩니다. 진행하시겠습니까?",
+        ):
+            self.append_log("기록 가져오기 취소")
+            return
+
+        self.config = self.make_config_from_vars()
+        self.set_record_import_busy(True)
+        self.vars["status"].set("기록 가져오는 중")
+        self.append_log(f"기록 가져오기 시작: {nickname}")
+        self.record_import_thread = threading.Thread(
+            target=self._record_import_worker,
+            args=(nickname,),
+            daemon=True,
+        )
+        self.record_import_thread.start()
+
+    def set_record_import_busy(self, busy: bool) -> None:
+        if self.record_import_button is not None:
+            self.record_import_button.configure(state=tk.DISABLED if busy else tk.NORMAL)
+
+    def _record_import_worker(self, nickname: str) -> None:
+        try:
+            button_results = self.record_client.fetch_all(nickname)
+            saved_results: list[dict[str, Any]] = []
+            for result in button_results:
+                path = self.record_store.replace_button_records(result.button, result.records)
+                saved_count = sum(len(title_records) for title_records in result.records.values())
+                saved_results.append(
+                    {
+                        "button": result.button,
+                        "api_count": result.count,
+                        "saved_count": saved_count,
+                        "path": str(path),
+                    }
+                )
+            self.event_queue.put(
+                {
+                    "type": "record_import_result",
+                    "nickname": nickname,
+                    "results": saved_results,
+                }
+            )
+        except Exception as exc:
+            self.event_queue.put({"type": "record_import_error", "message": str(exc)})
 
     def extract_trigger_template(self) -> None:
         if self.image is None:
@@ -505,7 +602,7 @@ class MainApp:
         try:
             trigger.crop(self.image).save(path)
             self.vars["template_path"].set(path)
-            self.append_log(f"템플릿 저장됨: {path}")
+            self.append_log(f"템플릿 저장됨: {Path(path).name}")
         except Exception as exc:
             messagebox.showerror("템플릿 오류", str(exc))
 
@@ -535,18 +632,18 @@ class MainApp:
             template_size = matcher.template.size if matcher.template is not None else None
             self.vars["score"].set(f"{score:.4f}")
             self.append_log(
-                f"트리거 캡처: {roi_path} / roi={roi.size} / template={template_size} / score={score:.4f}"
+                f"트리거 캡처: {roi_path.name} / roi={roi.size} / template={template_size} / score={score:.4f}"
             )
         except Exception as exc:
             messagebox.showerror("트리거 캡처 오류", str(exc))
 
-    def start_monitor(self) -> None:
+    def start_monitor(self) -> bool:
         if self.worker is not None and self.worker.is_alive():
-            return
+            return True
         config = self.make_config_from_vars()
         if not config.manual_boxes:
             messagebox.showwarning("좌표 없음", "먼저 OCR 박스를 하나 이상 지정하세요.")
-            return
+            return False
         missing_required = find_missing_required_boxes(config.manual_boxes)
         if missing_required:
             missing_text = ", ".join(missing_required)
@@ -554,15 +651,35 @@ class MainApp:
             messagebox.showwarning("필수 박스 없음", message)
             self.vars["status"].set("필수 박스 누락")
             self.append_log(message)
-            return
+            return False
         if not config.monitor_settings.template_path:
             messagebox.showwarning("템플릿 없음", "트리거 템플릿 이미지를 지정하세요.")
-            return
+            return False
         self.config = config
         self.worker = MonitorWorker(config, config.manual_boxes, self.event_queue)
         self.worker.start()
         self.vars["status"].set("감시 중")
         self.append_log("감시 스레드 시작")
+        return True
+
+    def start_monitor_with_game(self) -> None:
+        was_running = self.worker is not None and self.worker.is_alive()
+        if not self.start_monitor():
+            return
+        if not self.launch_steam_game() and not was_running:
+            self.stop_monitor()
+
+    def launch_steam_game(self) -> bool:
+        try:
+            os.startfile(STEAM_GAME_URL)  # type: ignore[attr-defined]
+        except OSError as exc:
+            message = f"Steam 게임 실행 실패: {exc}"
+            self.vars["status"].set("게임 실행 실패")
+            self.append_log(message)
+            messagebox.showerror("게임 실행 오류", message)
+            return False
+        self.append_log(f"Steam 게임 실행 요청: {STEAM_GAME_URL}")
+        return True
 
     def stop_monitor(self) -> None:
         if self.worker is not None:
@@ -585,6 +702,7 @@ class MainApp:
             return
         if self.message_overlay is not None:
             overlay = self.message_overlay
+            self.message_overlay_resume_on_close = True
             overlay.close()
             return
         self.resume_monitor()
@@ -696,7 +814,7 @@ class MainApp:
         try:
             debug_dir = self.save_manual_debug_data(source_event, manual_values)
             manual_event["manual_debug_dir"] = str(debug_dir)
-            self.append_log(f"수동 입력 저장: {debug_dir}")
+            self.append_log(f"수동 입력 저장: {debug_dir.name}")
         except Exception as exc:
             self.append_log(f"수동 입력 저장 오류: {exc}")
         self.show_registration_overlay(manual_event)
@@ -894,10 +1012,14 @@ class MainApp:
         return decision.should_register
 
     def show_record_failure_overlay(self, event: dict[str, Any]) -> None:
+        resume_on_close = not bool(
+            event.get("pause_after_detection", self.vars["pause_after_detection"].get())
+        )
         self.show_message_overlay(
             event,
             message="현재 플레이한 곡의 기록 갱신에 실패하였습니다.",
             log_message="기록 갱신 실패",
+            resume_on_close=resume_on_close,
         )
 
     def show_message_overlay(
@@ -905,7 +1027,11 @@ class MainApp:
         event: dict[str, Any] | None,
         message: str,
         log_message: str | None = None,
+        resume_on_close: bool = True,
     ) -> None:
+        message = self._shorten_paths_in_message(message)
+        if log_message is not None:
+            log_message = self._shorten_paths_in_message(log_message)
         if self.registration_overlay is not None:
             overlay = self.registration_overlay
             self.registration_overlay = None
@@ -916,6 +1042,7 @@ class MainApp:
             overlay.close_now()
         self.current_overlay_event = event
         self.message_overlay_close_log = log_message or message
+        self.message_overlay_resume_on_close = resume_on_close
         timeout_seconds = int(self.vars["message_overlay_timeout_seconds"].get())
         self.message_overlay = MessageOverlay(
             self.root,
@@ -926,18 +1053,21 @@ class MainApp:
         self.message_overlay.show()
 
     def on_message_overlay_closed(self) -> None:
+        resume_on_close = self.message_overlay_resume_on_close
         self.message_overlay = None
         self.current_overlay_event = None
         if self.message_overlay_close_log:
             self.append_log(self.message_overlay_close_log)
         self.message_overlay_close_log = None
-        self.resume_monitor()
+        self.message_overlay_resume_on_close = True
+        if resume_on_close:
+            self.resume_monitor()
 
     def handle_score_api_result(self, result: ScoreApiResult, values: dict[str, str]) -> None:
         if result.success:
             try:
                 record_path = self.record_store.update(values)
-                self.append_log(f"기록 저장: {record_path}")
+                self.append_log(f"기록 저장: {record_path.name}")
             except Exception as exc:
                 self.append_log(f"기록 저장 오류: {exc}")
                 self.show_message_overlay(None, message=f"기록 저장 오류: {exc}", log_message=f"기록 저장 오류: {exc}")
@@ -959,6 +1089,32 @@ class MainApp:
     def handle_score_api_error(self, message: str) -> None:
         clean_message = str(message).strip() or "API 요청 실패"
         self.show_message_overlay(None, message=clean_message, log_message=clean_message)
+
+    def handle_record_import_result(self, nickname: str, results: list[dict[str, Any]]) -> None:
+        self.set_record_import_busy(False)
+        summary_parts = []
+        total_saved = 0
+        for result in results:
+            button = result.get("button")
+            saved_count = int(result.get("saved_count", 0))
+            total_saved += saved_count
+            path_name = Path(str(result.get("path", ""))).name
+            summary_parts.append(f"{button}B {saved_count}건({path_name})")
+        summary = ", ".join(summary_parts)
+        message = f"{nickname} 기록 가져오기 완료: {summary}"
+        self.vars["status"].set("기록 가져오기 완료")
+        self.append_log(message)
+        messagebox.showinfo(
+            "기록 가져오기",
+            f"{nickname} 기록을 가져왔습니다.\n총 {total_saved}건\n{summary}",
+        )
+
+    def handle_record_import_error(self, message: str) -> None:
+        self.set_record_import_busy(False)
+        clean_message = str(message).strip() or "기록 가져오기 실패"
+        self.vars["status"].set("기록 가져오기 실패")
+        self.append_log(f"기록 가져오기 실패: {clean_message}")
+        messagebox.showerror("기록 가져오기 오류", clean_message)
 
     @staticmethod
     def _compact_overlay_value(value: str) -> str:
@@ -1008,9 +1164,12 @@ class MainApp:
         elif event_type == "detected":
             self.vars["status"].set("감지 완료")
             self.vars["score"].set(f"{float(event.get('score', 0.0)):.4f}")
-            self.append_log(f"감지됨: {event.get('text_path')}")
+            if event.get("text_path"):
+                self.append_log(f"감지됨: {Path(str(event.get('text_path'))).name}")
+            else:
+                self.append_log("감지됨")
             if event.get("screenshot_path"):
-                self.append_log(f"스크린샷: {event.get('screenshot_path')}")
+                self.append_log(f"스크린샷: {Path(str(event.get('screenshot_path'))).name}")
             if self.should_show_registration_overlay(event):
                 self.show_registration_overlay(event)
             else:
@@ -1037,6 +1196,12 @@ class MainApp:
                 self.handle_score_api_result(result, values)
         elif event_type == "score_api_error":
             self.handle_score_api_error(str(event.get("message", "")))
+        elif event_type == "record_import_result":
+            results = event.get("results", [])
+            if isinstance(results, list):
+                self.handle_record_import_result(str(event.get("nickname", "")), results)
+        elif event_type == "record_import_error":
+            self.handle_record_import_error(str(event.get("message", "")))
 
     def on_canvas_down(self, event: tk.Event) -> None:
         if self.image is None or not self.is_inside_image(event.x, event.y):
@@ -1496,9 +1661,32 @@ class MainApp:
         self.magnifier_label.config(text="x=-, y=-")
 
     def append_log(self, message: str) -> None:
+        message = self._shorten_paths_in_message(message)
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
         self.log_text.see(tk.END)
+
+    @staticmethod
+    def _shorten_paths_in_message(message: Any) -> str:
+        text = str(message)
+        for base in (APP_DIR, DEFAULT_DEBUG_DIR, DEFAULT_OUTPUT_DIR):
+            base_text = str(base)
+            text = text.replace(base_text + "\\", "")
+            text = text.replace(base_text + "/", "")
+            if text == base_text:
+                text = base.name
+
+        def quoted_replacement(match: re.Match[str]) -> str:
+            quote = match.group(1)
+            path_text = match.group(2)
+            return f"{quote}{Path(path_text).name or path_text}{quote}"
+
+        text = re.sub(r"(['\"])([A-Za-z]:\\[^'\"]+)(['\"])", quoted_replacement, text)
+        return re.sub(
+            r"(?<![\w])([A-Za-z]:\\[^\s:]+(?:\\[^\s:]+)+)",
+            lambda match: Path(match.group(1)).name or match.group(1),
+            text,
+        )
 
     def on_close(self) -> None:
         if self.registration_overlay is not None:

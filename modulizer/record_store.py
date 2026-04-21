@@ -105,6 +105,15 @@ class ButtonRecordStore:
         self.save(path, records)
         return path
 
+    def replace_button_records(
+        self,
+        button: str | int,
+        records: dict[str, dict[str, dict[str, int]]],
+    ) -> Path:
+        path = self.record_path(str(button))
+        self.save(path, records)
+        return path
+
     def record_path(self, button: str) -> Path:
         safe_button = safe_filename(self._compact(button) or "Button")
         return self.base_dir / f"{safe_button}b.dat"

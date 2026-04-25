@@ -127,3 +127,6 @@ UI개선<br>
 
 출처(원저작물): © NEOWIZ, DJMAX. All rights reserved. <br>
 (이 프로그램은 특정 회사/단체와 관련이 없는 제 3자 프로그램입니다.)
+
+https://github.com/Andrey1994/game_overlay_sdk
+해당 링크의 game_overlay_sdk 라이브러리의 수정된 버전이 포함되었습니다.

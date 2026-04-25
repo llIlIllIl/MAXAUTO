@@ -1,5 +1,5 @@
 {
-  "image_path": "",
+  "image_path": "Demo.png",
   "ocr_settings": {
     "min_confidence": 0.0,
     "grayscale": false,
@@ -8,18 +8,17 @@
   },
   "monitor_settings": {
     "trigger_box_name": "F5",
-    "template_path": "",
+    "template_path": "F5.png",
     "output_dir": "",
     "interval_ms": 500,
     "match_threshold": 0.9,
     "numeric_box_names": [
       "Score",
-      "CLASS_NUM",
       "BREAK",
       "Button"
     ],
     "overlay_timeout_seconds": 10,
-    "message_overlay_timeout_seconds": 1,
+    "message_overlay_timeout_seconds": 3,
     "compare_button_record": true,
     "save_screenshot": false,
     "pause_after_detection": true,
@@ -33,27 +32,6 @@
       "y1": 15,
       "x2": 1721,
       "y2": 65
-    },
-    {
-      "name": "CLASS_NUM",
-      "x1": 2091,
-      "y1": 740,
-      "x2": 2279,
-      "y2": 792
-    },
-    {
-      "name": "Class_title",
-      "x1": 2090,
-      "y1": 708,
-      "x2": 2436,
-      "y2": 750
-    },
-    {
-      "name": "Class_UP",
-      "x1": 2347,
-      "y1": 746,
-      "x2": 2462,
-      "y2": 787
     },
     {
       "name": "F5",

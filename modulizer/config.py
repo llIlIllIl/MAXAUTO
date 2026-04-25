@@ -14,6 +14,23 @@ from .constants import (
     REQUIRED_BOX_NAMES,
 )
 
+OVERLAY_BACKEND_DESKTOP = "desktop"
+OVERLAY_BACKEND_HUDHOOK_BRIDGE = "hudhook_bridge"
+OVERLAY_BACKEND_GAME_OVERLAY_SDK = OVERLAY_BACKEND_HUDHOOK_BRIDGE
+OVERLAY_BACKEND_PYTHON_EXCLUSIVE_COMPAT = "python_exclusive_compat"
+DEFAULT_GAME_OVERLAY_TARGET_PROCESS = "DJMAX RESPECT V.exe"
+DEFAULT_GAME_OVERLAY_STEAM_APP_ID = 960170
+DEFAULT_GAME_OVERLAY_ATTACH_STRATEGY = "run_process_if_path_else_monitor"
+DEFAULT_STREAMER_HOST_PORT = 8765
+VALID_OVERLAY_BACKENDS = {
+    OVERLAY_BACKEND_DESKTOP,
+    OVERLAY_BACKEND_HUDHOOK_BRIDGE,
+}
+LEGACY_OVERLAY_BACKENDS = {
+    OVERLAY_BACKEND_PYTHON_EXCLUSIVE_COMPAT: OVERLAY_BACKEND_GAME_OVERLAY_SDK,
+    "game_overlay_sdk": OVERLAY_BACKEND_GAME_OVERLAY_SDK,
+}
+
 
 def parse_box_name_list(value: Any) -> list[str]:
     if isinstance(value, list):
@@ -37,6 +54,14 @@ def find_missing_required_boxes(boxes: list[BoxRegion]) -> list[str]:
 def normalize_box_name(name: str) -> str:
     clean_name = str(name).strip()
     return LEGACY_BOX_NAME_MAP.get(clean_name, clean_name)
+
+
+def normalize_overlay_backend(value: Any) -> str:
+    backend = str(value or "").strip()
+    backend = LEGACY_OVERLAY_BACKENDS.get(backend, backend)
+    if backend in VALID_OVERLAY_BACKENDS:
+        return backend
+    return OVERLAY_BACKEND_DESKTOP
 
 
 @dataclass
@@ -63,6 +88,20 @@ class MonitorSettings:
     include_trigger_box_in_ocr: bool = False
     score_outline_ocr: bool = True
     record_import_nickname: str = ""
+    overlay_backend: str = OVERLAY_BACKEND_DESKTOP
+    python_exclusive_warning_accepted: bool = False
+    python_exclusive_click_through: bool = False
+    python_exclusive_focus_safe: bool = True
+    game_overlay_target_process: str = DEFAULT_GAME_OVERLAY_TARGET_PROCESS
+    game_overlay_steam_app_id: int = DEFAULT_GAME_OVERLAY_STEAM_APP_ID
+    game_overlay_exe_path: str = ""
+    game_overlay_attach_strategy: str = DEFAULT_GAME_OVERLAY_ATTACH_STRATEGY
+    game_overlay_warning_accepted: bool = False
+    game_overlay_warning_version: int = 0
+    streamer_host_enabled: bool = False
+    streamer_username: str = ""
+    streamer_button: str = ""
+    streamer_host_port: int = DEFAULT_STREAMER_HOST_PORT
 
 
 @dataclass
@@ -137,6 +176,43 @@ class ConfigStore:
                 include_trigger_box_in_ocr=bool(monitor_raw.get("include_trigger_box_in_ocr", False)),
                 score_outline_ocr=bool(monitor_raw.get("score_outline_ocr", True)),
                 record_import_nickname=str(monitor_raw.get("record_import_nickname", "")).strip(),
+                overlay_backend=normalize_overlay_backend(monitor_raw.get("overlay_backend", OVERLAY_BACKEND_DESKTOP)),
+                python_exclusive_warning_accepted=bool(
+                    monitor_raw.get("python_exclusive_warning_accepted", False)
+                ),
+                python_exclusive_click_through=bool(monitor_raw.get("python_exclusive_click_through", False)),
+                python_exclusive_focus_safe=bool(monitor_raw.get("python_exclusive_focus_safe", True)),
+                game_overlay_target_process=str(
+                    monitor_raw.get("game_overlay_target_process", DEFAULT_GAME_OVERLAY_TARGET_PROCESS)
+                    or DEFAULT_GAME_OVERLAY_TARGET_PROCESS
+                ).strip(),
+                game_overlay_steam_app_id=int(
+                    monitor_raw.get("game_overlay_steam_app_id", DEFAULT_GAME_OVERLAY_STEAM_APP_ID)
+                    or DEFAULT_GAME_OVERLAY_STEAM_APP_ID
+                ),
+                game_overlay_exe_path=str(monitor_raw.get("game_overlay_exe_path", "") or "").strip(),
+                game_overlay_attach_strategy=str(
+                    monitor_raw.get("game_overlay_attach_strategy", DEFAULT_GAME_OVERLAY_ATTACH_STRATEGY)
+                    or DEFAULT_GAME_OVERLAY_ATTACH_STRATEGY
+                ).strip(),
+                game_overlay_warning_accepted=bool(monitor_raw.get("game_overlay_warning_accepted", False)),
+                game_overlay_warning_version=int(monitor_raw.get("game_overlay_warning_version", 0) or 0),
+                streamer_host_enabled=bool(
+                    monitor_raw.get(
+                        "streamer_host_enabled",
+                        monitor_raw.get("v_archive_host_enabled", False),
+                    )
+                ),
+                streamer_username=str(
+                    monitor_raw.get("streamer_username", monitor_raw.get("v_archive_username", "")) or ""
+                ).strip(),
+                streamer_button=str(
+                    monitor_raw.get("streamer_button", monitor_raw.get("v_archive_button", "")) or ""
+                ).strip(),
+                streamer_host_port=int(
+                    monitor_raw.get("streamer_host_port", DEFAULT_STREAMER_HOST_PORT)
+                    or DEFAULT_STREAMER_HOST_PORT
+                ),
             ),
             manual_boxes=boxes,
         )

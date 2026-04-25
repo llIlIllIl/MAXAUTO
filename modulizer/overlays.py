@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import sys
 from typing import Any
 
 import tkinter as tk
@@ -8,7 +10,169 @@ from tkinter import ttk
 from .system import monitor_frame_interval_ms
 
 
-class RegistrationOverlay:
+def _target_monitor_rect(root: tk.Tk) -> tuple[int, int, int, int]:
+    if sys.platform != "win32":
+        return (0, 0, root.winfo_screenwidth(), root.winfo_screenheight())
+
+    try:
+        user32 = ctypes.windll.user32
+        MONITOR_DEFAULTTONEAREST = 2
+
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", ctypes.c_long),
+                ("top", ctypes.c_long),
+                ("right", ctypes.c_long),
+                ("bottom", ctypes.c_long),
+            ]
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.c_ulong),
+                ("rcMonitor", RECT),
+                ("rcWork", RECT),
+                ("dwFlags", ctypes.c_ulong),
+            ]
+
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        user32.MonitorFromWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        user32.MonitorFromWindow.restype = ctypes.c_void_p
+        user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
+        user32.GetMonitorInfoW.restype = ctypes.c_int
+
+        hwnd = user32.GetForegroundWindow()
+        monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        if not monitor:
+            raise RuntimeError("No monitor for foreground window.")
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            raise RuntimeError("GetMonitorInfoW failed.")
+        rect = info.rcMonitor
+        return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+    except Exception:
+        return (0, 0, root.winfo_screenwidth(), root.winfo_screenheight())
+
+
+def _apply_win32_overlay_styles(window: tk.Toplevel, click_through: bool, focus_safe: bool) -> bool:
+    if sys.platform != "win32":
+        return False
+
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = ctypes.c_void_p(int(window.winfo_id()))
+        GWL_EXSTYLE = -20
+        WS_EX_TOPMOST = 0x00000008
+        WS_EX_TRANSPARENT = 0x00000020
+        WS_EX_TOOLWINDOW = 0x00000080
+        WS_EX_LAYERED = 0x00080000
+        WS_EX_NOACTIVATE = 0x08000000
+        LWA_ALPHA = 0x00000002
+        HWND_TOPMOST = ctypes.c_void_p(-1)
+        SW_SHOWNOACTIVATE = 4
+        SWP_NOSIZE = 0x0001
+        SWP_NOMOVE = 0x0002
+        SWP_NOOWNERZORDER = 0x0200
+        SWP_SHOWWINDOW = 0x0040
+        SWP_NOACTIVATE = 0x0010
+
+        user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.GetWindowLongW.restype = ctypes.c_long
+        user32.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+        user32.SetWindowLongW.restype = ctypes.c_long
+        user32.SetLayeredWindowAttributes.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_ubyte,
+            ctypes.c_ulong,
+        ]
+        user32.SetLayeredWindowAttributes.restype = ctypes.c_int
+        user32.SetWindowPos.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+        ]
+        user32.SetWindowPos.restype = ctypes.c_int
+        user32.ShowWindowAsync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.ShowWindowAsync.restype = ctypes.c_int
+
+        style = int(user32.GetWindowLongW(hwnd, GWL_EXSTYLE))
+        style |= WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW
+        if click_through:
+            style |= WS_EX_TRANSPARENT
+        else:
+            style &= ~WS_EX_TRANSPARENT
+        if focus_safe:
+            style |= WS_EX_NOACTIVATE
+        else:
+            style &= ~WS_EX_NOACTIVATE
+        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+        user32.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)
+        user32.ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE)
+
+        flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW
+        if focus_safe:
+            flags |= SWP_NOACTIVATE
+        return bool(user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags))
+    except Exception:
+        return False
+
+
+class _ExclusiveTopmostKeeper:
+    topmost_keepalive_ms = 250
+
+    def _has_existing_overlay_window(self) -> bool:
+        window = getattr(self, "window", None)
+        if window is None:
+            return False
+        try:
+            return bool(window.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _reapply_exclusive_topmost(self) -> bool:
+        if not getattr(self, "exclusive_compat", False):
+            return False
+        window = getattr(self, "window", None)
+        if window is None or not self._has_existing_overlay_window():
+            return False
+        return _apply_win32_overlay_styles(
+            window,
+            bool(getattr(self, "click_through", False)),
+            bool(getattr(self, "focus_safe", True)),
+        )
+
+    def _start_topmost_keepalive(self) -> None:
+        if not getattr(self, "exclusive_compat", False):
+            return
+        if getattr(self, "topmost_job", None) is not None:
+            return
+        self._reapply_exclusive_topmost()
+        self.topmost_job = self.root.after(self.topmost_keepalive_ms, self._topmost_keepalive_tick)
+
+    def _topmost_keepalive_tick(self) -> None:
+        self.topmost_job = None
+        if not getattr(self, "exclusive_compat", False) or not self._has_existing_overlay_window():
+            return
+        self._reapply_exclusive_topmost()
+        self.topmost_job = self.root.after(self.topmost_keepalive_ms, self._topmost_keepalive_tick)
+
+    def _cancel_topmost_keepalive(self) -> None:
+        job = getattr(self, "topmost_job", None)
+        if job is None:
+            return
+        try:
+            self.root.after_cancel(job)
+        except tk.TclError:
+            pass
+        self.topmost_job = None
+
+
+class RegistrationOverlay(_ExclusiveTopmostKeeper):
     def __init__(
         self,
         root: tk.Tk,
@@ -25,6 +189,9 @@ class RegistrationOverlay:
         on_cancel: Any,
         on_retry: Any,
         on_manual: Any,
+        exclusive_compat: bool = False,
+        click_through: bool = False,
+        focus_safe: bool = True,
     ) -> None:
         self.root = root
         self.heading = heading
@@ -40,6 +207,9 @@ class RegistrationOverlay:
         self.on_cancel = on_cancel
         self.on_retry = on_retry
         self.on_manual = on_manual
+        self.exclusive_compat = exclusive_compat
+        self.click_through = click_through
+        self.focus_safe = focus_safe
         self.window: tk.Toplevel | None = None
         self.progress_canvas: tk.Canvas | None = None
         self.finished = False
@@ -47,6 +217,7 @@ class RegistrationOverlay:
         self.elapsed_ms = 0
         self.timer_job: str | None = None
         self.animation_job: str | None = None
+        self.topmost_job: str | None = None
 
         self.width = 520
         self.height = 150
@@ -168,15 +339,21 @@ class RegistrationOverlay:
         )
         manual_button.pack(side=tk.RIGHT, padx=(0, 8))
 
-        screen_w = self.root.winfo_screenwidth()
+        monitor_left, monitor_top, monitor_right, monitor_bottom = _target_monitor_rect(self.root)
+        monitor_w = max(1, monitor_right - monitor_left)
         self.window.update_idletasks()
-        self.width = min(max(self.width, self.window.winfo_reqwidth()), max(320, screen_w - (self.margin_right * 2)))
+        self.width = min(max(self.width, self.window.winfo_reqwidth()), max(320, monitor_w - (self.margin_right * 2)))
         self.height = max(self.height, self.window.winfo_reqheight())
-        self.visible_x = screen_w - self.width - self.margin_right
-        self.hidden_x = screen_w + 24
-        self.y = self.margin_top
+        self.visible_x = monitor_right - self.width - self.margin_right
+        self.hidden_x = monitor_right + 24
+        self.y = monitor_top + self.margin_top
         self.window.geometry(f"{self.width}x{self.height}+{self.hidden_x}+{self.y}")
+        if self.exclusive_compat:
+            self._reapply_exclusive_topmost()
         self.window.deiconify()
+        if self.exclusive_compat:
+            self._reapply_exclusive_topmost()
+            self._start_topmost_keepalive()
         self._draw_progress(0.0)
         self._slide_to(self.hidden_x, self.visible_x, self.animation_ms, after=self._start_timer)
 
@@ -244,6 +421,7 @@ class RegistrationOverlay:
         self.root.after(0, callback)
 
     def _cancel_jobs(self) -> None:
+        self._cancel_topmost_keepalive()
         for job in (self.timer_job, self.animation_job):
             if job is not None:
                 try:
@@ -265,6 +443,7 @@ class RegistrationOverlay:
             eased = 1 - (1 - t) ** 3
             x = int(start_x + (end_x - start_x) * eased)
             self.window.geometry(f"{self.width}x{self.height}+{x}+{self.y}")
+            self._reapply_exclusive_topmost()
             if frame >= frames:
                 if after is not None:
                     after()
@@ -291,22 +470,29 @@ class RegistrationOverlay:
         )
 
 
-class MessageOverlay:
+class MessageOverlay(_ExclusiveTopmostKeeper):
     def __init__(
         self,
         root: tk.Tk,
         message: str,
         duration_seconds: int,
         on_close: Any,
+        exclusive_compat: bool = False,
+        click_through: bool = False,
+        focus_safe: bool = True,
     ) -> None:
         self.root = root
         self.message = message
         self.duration_seconds = max(1, int(duration_seconds))
         self.on_close = on_close
+        self.exclusive_compat = exclusive_compat
+        self.click_through = click_through
+        self.focus_safe = focus_safe
         self.window: tk.Toplevel | None = None
         self.progress_canvas: tk.Canvas | None = None
         self.timer_job: str | None = None
         self.animation_job: str | None = None
+        self.topmost_job: str | None = None
         self.closed = False
         self.elapsed_ms = 0
         self.width = 520
@@ -346,15 +532,21 @@ class MessageOverlay:
             font=("Malgun Gothic", 14, "bold"),
         ).pack(fill=tk.BOTH, expand=True)
 
-        screen_w = self.root.winfo_screenwidth()
+        monitor_left, monitor_top, monitor_right, monitor_bottom = _target_monitor_rect(self.root)
+        monitor_w = max(1, monitor_right - monitor_left)
         self.window.update_idletasks()
-        self.width = min(max(self.width, self.window.winfo_reqwidth()), max(320, screen_w - (self.margin_right * 2)))
+        self.width = min(max(self.width, self.window.winfo_reqwidth()), max(320, monitor_w - (self.margin_right * 2)))
         self.height = max(self.height, self.window.winfo_reqheight())
-        self.visible_x = screen_w - self.width - self.margin_right
-        self.hidden_x = screen_w + 24
-        self.y = self.margin_top
+        self.visible_x = monitor_right - self.width - self.margin_right
+        self.hidden_x = monitor_right + 24
+        self.y = monitor_top + self.margin_top
         self.window.geometry(f"{self.width}x{self.height}+{self.hidden_x}+{self.y}")
+        if self.exclusive_compat:
+            self._reapply_exclusive_topmost()
         self.window.deiconify()
+        if self.exclusive_compat:
+            self._reapply_exclusive_topmost()
+            self._start_topmost_keepalive()
         self._draw_progress(0.0)
         self._slide_to(self.hidden_x, self.visible_x, self.animation_ms, after=self._start_timer)
 
@@ -404,6 +596,7 @@ class MessageOverlay:
         self.timer_job = self.root.after(self.timer_interval_ms, self._tick)
 
     def _cancel_jobs(self) -> None:
+        self._cancel_topmost_keepalive()
         for job in (self.timer_job, self.animation_job):
             if job is not None:
                 try:
@@ -425,6 +618,7 @@ class MessageOverlay:
             eased = 1 - (1 - t) ** 3
             x = int(start_x + (end_x - start_x) * eased)
             self.window.geometry(f"{self.width}x{self.height}+{x}+{self.y}")
+            self._reapply_exclusive_topmost()
             if frame >= frames:
                 if after is not None:
                     after()

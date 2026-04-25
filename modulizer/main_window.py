@@ -5,6 +5,7 @@ import os
 import queue
 import re
 import threading
+import time
 import unicodedata
 from datetime import datetime
 from pathlib import Path
@@ -20,9 +21,16 @@ from .boxes import BoxRegion
 from .config import (
     AppConfig,
     ConfigStore,
+    DEFAULT_GAME_OVERLAY_ATTACH_STRATEGY,
+    DEFAULT_GAME_OVERLAY_STEAM_APP_ID,
+    DEFAULT_GAME_OVERLAY_TARGET_PROCESS,
+    DEFAULT_STREAMER_HOST_PORT,
     MonitorSettings,
     OCRSettings,
+    OVERLAY_BACKEND_DESKTOP,
+    OVERLAY_BACKEND_GAME_OVERLAY_SDK,
     find_missing_required_boxes,
+    normalize_overlay_backend,
     parse_box_name_list,
 )
 from .constants import (
@@ -35,29 +43,81 @@ from .constants import (
     REQUIRED_BOX_NAMES,
     RESAMPLE_LANCZOS,
 )
+from .game_overlay_backend import GameOverlayBackend, GameOverlayElevatedProxyBackend, GameOverlaySettings
 from .hotkeys import GlobalEnterListener
 from .monitor_worker import MonitorWorker
 from .ocr_service import OCRService
 from .overlays import ManualOverlayInputDialog, MessageOverlay, RegistrationOverlay
 from .record_store import ButtonRecordStore
+from .system import monitor_frame_interval_ms, process_window_frame_interval_ms
 from .v_archive_api import ScoreApiResult, VArchiveRecordClient, VArchiveScoreClient
+from .v_archive_host import (
+    VALID_BUTTONS,
+    VArchiveHostServer,
+    can_request_windows_firewall_rule,
+    firewall_rule_command,
+    request_windows_firewall_rule,
+)
 
 
 STEAM_GAME_URL = "steam://rungameid/960170"
+OVERLAY_BACKEND_LABELS = {
+    OVERLAY_BACKEND_DESKTOP: "기본 모드",
+    OVERLAY_BACKEND_GAME_OVERLAY_SDK: "전체화면 지원 모드(베타)",
+}
+OVERLAY_BACKEND_VALUES = tuple(OVERLAY_BACKEND_LABELS.values())
+OVERLAY_BACKEND_BY_LABEL = {label: backend for backend, label in OVERLAY_BACKEND_LABELS.items()}
+GAME_OVERLAY_WARNING_LOG = (
+    "전체화면 지원 모드(베타): game-overlay-sdk 렌더링 후킹을 시도합니다. "
+    "안티치트 차단 가능성이 있으며 실패 시 기존 오버레이로 fallback합니다."
+)
+GAME_OVERLAY_WARNING_VERSION = 2
+GAME_OVERLAY_WARNING_TEXT = (
+    "전체화면 지원 모드는 현재 베타 상태입니다.\n\n"
+    '이 기능은 파이썬 라이브러리인 "game-overlay-sdk"를 기반으로 AI가 MAXOCR에 맞게 확장한 라이브러리를 포함하고 있습니다.\n\n'
+    "이 방식은 게임 프로세스에 외부 DLL을 주입하여, 게임 화면 위에 오버레이 이미지를 렌더링하는 방식으로 작동합니다.\n\n\n"
+    "MAXOCR은 안티치트 우회, 은닉, 커널/드라이버 방식, 게임 파일 변조, 리버스 엔지니어링을 목적으로 제작되지 않았습니다.\n"
+    "그러나 이 방식은 게임사가 제공하거나 승인하지 않은 외부 프로그램을 사용하여 게임 화면 표시 방식에 영향을 주는 행위로 해석될 여지가 있습니다.\n\n\n"
+    "이에 따라 게임 약관 또는 운영 정책에 따라 계정 제재, 서비스 이용 제한, 라이선스 종료 등의 불이익이 발생할 수 있습니다.\n"
+    "MAXOCR은 이 기능 사용으로 인해 발생하는 불이익에 대해 책임지지 않습니다.\n\n"
+    "확인을 누르면 위 내용을 인지했으며, 해당 기능 사용에 따른 위험과 불이익 가능성을 감수하는 것에 동의합니다."
+)
+PYTHON_EXCLUSIVE_WARNING_LOG = GAME_OVERLAY_WARNING_LOG
+PYTHON_EXCLUSIVE_WARNING_TEXT = GAME_OVERLAY_WARNING_TEXT
+GAME_OVERLAY_ANIMATION_MS = 360
+GAME_OVERLAY_ELEVATION_TITLE = "관리자 권한 필요"
+GAME_OVERLAY_ELEVATION_TEXT = (
+    "전체화면 지원 모드는 관리자 권한이 필요합니다.\n\n"
+    "메인 프로그램은 그대로 두고, 전체화면 오버레이에 필요한 helper만 관리자 권한으로 실행합니다.\n"
+    "확인을 누르면 권한 상승 요청이 표시됩니다.\n"
+    "권한 상승에 실패하거나 취소하면 실행되지 않습니다."
+)
+GAME_OVERLAY_ELEVATION_FAILURE_TEXT = (
+    "관리자 권한 상승이 취소되었거나 실패하여 전체화면 지원 모드를 실행하지 않았습니다."
+)
 
 
 class MainApp:
-    def __init__(self, root: tk.Tk, debug_mode: bool = False) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        debug_mode: bool = False,
+        startup_action: str | None = None,
+        skip_game_overlay_warning_once: bool = False,
+    ) -> None:
         self.root = root
         self.root.title("MAXOCR")
-        self.root.geometry("1450x900")
+        self.root.geometry("1450x920")
         self.root.minsize(1100, 720)
         self.debug_mode = debug_mode
+        self.startup_action = startup_action
+        self.skip_game_overlay_warning_once = bool(skip_game_overlay_warning_once)
 
         self.config = AppConfig()
         self.record_store = ButtonRecordStore()
         self.score_client = VArchiveScoreClient()
         self.record_client = VArchiveRecordClient()
+        self.v_archive_host = VArchiveHostServer()
         self.image: Image.Image | None = None
         self.display_photo: ImageTk.PhotoImage | None = None
         self.scale_ratio = 1.0
@@ -77,6 +137,24 @@ class MainApp:
         self.coordinate_variables: dict[str, BoxRegion] = {}
         self.event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self.worker: MonitorWorker | None = None
+        self.game_overlay_backend: GameOverlayBackend | None = None
+        self.game_overlay_registration_active = False
+        self.game_overlay_message_active = False
+        self.game_overlay_timer_job: str | None = None
+        self.game_overlay_started_at = 0.0
+        self.game_overlay_deadline_at = 0.0
+        self.game_overlay_duration_seconds = 1
+        self.game_overlay_timeout_callback: Any | None = None
+        self.game_overlay_payload: dict[str, Any] | None = None
+        self.game_overlay_phase = "hidden"
+        self.game_overlay_animation_started_at = 0.0
+        self.game_overlay_after_hide_callback: Any | None = None
+        self.game_overlay_hide_deadline_at: float | None = None
+        self.game_overlay_last_progress = 0.0
+        self.game_overlay_current_reveal = 0.0
+        self.game_overlay_hide_start_reveal = 1.0
+        self.game_overlay_tick_interval_ms = 0
+        self.game_overlay_dependency_available = False
         self.global_enter_listener: GlobalEnterListener | None = None
         self.registration_overlay: RegistrationOverlay | None = None
         self.message_overlay: MessageOverlay | None = None
@@ -88,6 +166,7 @@ class MainApp:
         self.ocr_model_thread: threading.Thread | None = None
         self.record_import_thread: threading.Thread | None = None
         self.record_import_button: ttk.Button | None = None
+        self.streamer_settings_window: tk.Toplevel | None = None
 
         self.vars = self._create_vars()
         self.box_edit_vars = self._create_box_edit_vars()
@@ -95,9 +174,20 @@ class MainApp:
         self._bind_events()
         self.clear_magnifier()
         self._load_default_config()
+        self.check_game_overlay_dependency()
         self.start_ocr_model_preload()
         self.start_global_enter_listener()
         self._poll_worker_events()
+        if self.startup_action:
+            self.root.after(0, self._run_startup_action)
+
+    def _run_startup_action(self) -> None:
+        action = self.startup_action
+        self.startup_action = None
+        if action == "monitor_with_game":
+            self.start_monitor_with_game()
+        elif action == "monitor":
+            self.start_monitor()
 
     def _create_vars(self) -> dict[str, tk.Variable]:
         return {
@@ -111,14 +201,31 @@ class MainApp:
             "interval_ms": tk.IntVar(value=500),
             "match_threshold": tk.DoubleVar(value=DEFAULT_MATCH_THRESHOLD),
             "numeric_box_names": tk.StringVar(value="Score, CLASS_NUM"),
+            "overlay_backend": tk.StringVar(value=OVERLAY_BACKEND_LABELS[OVERLAY_BACKEND_DESKTOP]),
             "overlay_timeout_seconds": tk.IntVar(value=10),
             "message_overlay_timeout_seconds": tk.IntVar(value=10),
+            "python_exclusive_warning_accepted": tk.BooleanVar(value=False),
+            "python_exclusive_click_through": tk.BooleanVar(value=False),
+            "python_exclusive_focus_safe": tk.BooleanVar(value=True),
+            "game_overlay_warning_accepted": tk.BooleanVar(value=False),
+            "game_overlay_warning_version": tk.IntVar(value=0),
+            "game_overlay_target_process": tk.StringVar(value=DEFAULT_GAME_OVERLAY_TARGET_PROCESS),
+            "game_overlay_steam_app_id": tk.IntVar(value=DEFAULT_GAME_OVERLAY_STEAM_APP_ID),
+            "game_overlay_exe_path": tk.StringVar(value=""),
+            "game_overlay_attach_strategy": tk.StringVar(value=DEFAULT_GAME_OVERLAY_ATTACH_STRATEGY),
             "compare_button_record": tk.BooleanVar(value=True),
             "save_screenshot": tk.BooleanVar(value=True),
             "pause_after_detection": tk.BooleanVar(value=True),
             "include_trigger_box_in_ocr": tk.BooleanVar(value=False),
             "score_outline_ocr": tk.BooleanVar(value=True),
             "record_import_nickname": tk.StringVar(value=""),
+            "streamer_host_enabled": tk.BooleanVar(value=False),
+            "streamer_username": tk.StringVar(value=""),
+            "streamer_button": tk.StringVar(value=""),
+            "streamer_host_port": tk.IntVar(value=DEFAULT_STREAMER_HOST_PORT),
+            "streamer_network_url": tk.StringVar(value=""),
+            "streamer_local_url": tk.StringVar(value=""),
+            "streamer_host_status": tk.StringVar(value="중지됨"),
             "status": tk.StringVar(value="대기"),
             "score": tk.StringVar(value="-"),
         }
@@ -265,6 +372,63 @@ class MainApp:
         ttk.Entry(frame, textvariable=self.vars["numeric_box_names"]).grid(row=row, column=1, columnspan=2, sticky="ew", pady=3)
 
         row += 1
+        ttk.Label(frame, text="오버레이 모드").grid(row=row, column=0, sticky="w", pady=3)
+        self.overlay_backend_combo = ttk.Combobox(
+            frame,
+            textvariable=self.vars["overlay_backend"],
+            values=OVERLAY_BACKEND_VALUES,
+            state="readonly",
+            width=28,
+        )
+        self.overlay_backend_combo.grid(row=row, column=1, columnspan=2, sticky="ew", pady=3)
+        self.overlay_backend_combo.bind("<<ComboboxSelected>>", self.on_overlay_backend_selected)
+
+        row += 1
+        ttk.Checkbutton(
+            frame,
+            text="전체화면 모드 마우스 통과",
+            variable=self.vars["python_exclusive_click_through"],
+        ).grid(row=row, column=1, columnspan=2, sticky="w", pady=3)
+
+        row += 1
+        ttk.Checkbutton(
+            frame,
+            text="전체화면 모드 포커스 보호",
+            variable=self.vars["python_exclusive_focus_safe"],
+        ).grid(row=row, column=1, columnspan=2, sticky="w", pady=3)
+
+        row += 1
+        ttk.Label(frame, text="게임 프로세스").grid(row=row, column=0, sticky="w", pady=3)
+        ttk.Entry(frame, textvariable=self.vars["game_overlay_target_process"]).grid(
+            row=row, column=1, columnspan=2, sticky="ew", pady=3
+        )
+
+        row += 1
+        ttk.Label(frame, text="게임 EXE 경로").grid(row=row, column=0, sticky="w", pady=3)
+        game_exe_frame = ttk.Frame(frame)
+        game_exe_frame.grid(row=row, column=1, columnspan=2, sticky="ew", pady=3)
+        ttk.Entry(game_exe_frame, textvariable=self.vars["game_overlay_exe_path"]).pack(
+            side=tk.LEFT,
+            fill=tk.X,
+            expand=True,
+        )
+        ttk.Button(game_exe_frame, text="찾기", command=self.pick_game_overlay_exe_path).pack(
+            side=tk.LEFT,
+            padx=(6, 0),
+        )
+
+        row += 1
+        ttk.Label(frame, text="Steam App ID").grid(row=row, column=0, sticky="w", pady=3)
+        ttk.Spinbox(
+            frame,
+            from_=1,
+            to=9999999,
+            increment=1,
+            textvariable=self.vars["game_overlay_steam_app_id"],
+            width=10,
+        ).grid(row=row, column=1, sticky="w", pady=3)
+
+        row += 1
         ttk.Label(frame, text="유저 닉네임").grid(row=row, column=0, sticky="w", pady=3)
         import_frame = ttk.Frame(frame)
         import_frame.grid(row=row, column=1, columnspan=2, sticky="ew", pady=3)
@@ -280,6 +444,18 @@ class MainApp:
         )
         self.record_import_button.pack(side=tk.LEFT, padx=(6, 0))
         import_frame.columnconfigure(0, weight=1)
+
+        row += 1
+        ttk.Label(frame, text="스트리머").grid(row=row, column=0, sticky="w", pady=3)
+        streamer_frame = ttk.Frame(frame)
+        streamer_frame.grid(row=row, column=1, columnspan=2, sticky="ew", pady=3)
+        ttk.Button(streamer_frame, text="스트리머 설정", command=self.open_streamer_settings_window).pack(
+            side=tk.LEFT,
+        )
+        ttk.Label(streamer_frame, textvariable=self.vars["streamer_host_status"]).pack(
+            side=tk.LEFT,
+            padx=(8, 0),
+        )
 
         row += 1
         ttk.Label(frame, text="점수반영 오버레이 시간(초)").grid(row=row, column=0, sticky="w", pady=3)
@@ -346,6 +522,68 @@ class MainApp:
         self.root.bind_all("<KeyPress-equal>", lambda _event: self.handle_manual_overlay_key())
         self.vars["numeric_box_names"].trace_add("write", lambda *_args: self.refresh_box_list())
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def overlay_backend_from_var(self) -> str:
+        value = str(self.vars["overlay_backend"].get()).strip()
+        return normalize_overlay_backend(OVERLAY_BACKEND_BY_LABEL.get(value, value))
+
+    def set_overlay_backend_var(self, backend: str) -> None:
+        backend = normalize_overlay_backend(backend)
+        self.vars["overlay_backend"].set(OVERLAY_BACKEND_LABELS[backend])
+
+    def on_overlay_backend_selected(self, _event: tk.Event | None = None) -> None:
+        backend = self.overlay_backend_from_var()
+        if backend != OVERLAY_BACKEND_GAME_OVERLAY_SDK:
+            return
+        if self.ensure_game_overlay_warning_accepted():
+            return
+        self.set_overlay_backend_var(OVERLAY_BACKEND_DESKTOP)
+
+    def ensure_game_overlay_warning_accepted(self) -> bool:
+        if self.skip_game_overlay_warning_once:
+            self.skip_game_overlay_warning_once = False
+            return True
+        accepted = messagebox.askokcancel("전체화면 지원 모드(베타)", GAME_OVERLAY_WARNING_TEXT)
+        self.vars["game_overlay_warning_accepted"].set(bool(accepted))
+        self.vars["game_overlay_warning_version"].set(GAME_OVERLAY_WARNING_VERSION if accepted else 0)
+        return bool(accepted)
+
+    def ensure_python_exclusive_warning_accepted(self) -> bool:
+        return self.ensure_game_overlay_warning_accepted()
+
+    @staticmethod
+    def ensure_game_overlay_elevation_requested() -> bool:
+        if GameOverlayBackend.is_elevated():
+            return True
+        return bool(messagebox.askokcancel(GAME_OVERLAY_ELEVATION_TITLE, GAME_OVERLAY_ELEVATION_TEXT))
+
+    def python_exclusive_overlay_options(self) -> dict[str, bool]:
+        exclusive_compat = self.overlay_backend_from_var() == OVERLAY_BACKEND_GAME_OVERLAY_SDK
+        return {
+            "exclusive_compat": exclusive_compat,
+            "click_through": exclusive_compat and bool(self.vars["python_exclusive_click_through"].get()),
+            "focus_safe": exclusive_compat and bool(self.vars["python_exclusive_focus_safe"].get()),
+        }
+
+    def game_overlay_settings_from_vars(self) -> GameOverlaySettings:
+        return GameOverlaySettings(
+            target_process=str(self.vars["game_overlay_target_process"].get()).strip()
+            or DEFAULT_GAME_OVERLAY_TARGET_PROCESS,
+            steam_app_id=int(self.vars["game_overlay_steam_app_id"].get() or DEFAULT_GAME_OVERLAY_STEAM_APP_ID),
+            exe_path=str(self.vars["game_overlay_exe_path"].get()).strip(),
+            attach_strategy=str(self.vars["game_overlay_attach_strategy"].get()).strip()
+            or DEFAULT_GAME_OVERLAY_ATTACH_STRATEGY,
+        )
+
+    def check_game_overlay_dependency(self, log_success: bool = False) -> bool:
+        result = GameOverlayBackend.validate_import()
+        self.game_overlay_dependency_available = result.success
+        if result.success:
+            if log_success:
+                self.append_log(result.message)
+            return True
+        self.append_log(result.message)
+        return False
 
     def start_global_enter_listener(self) -> None:
         if self.global_enter_listener is not None and self.global_enter_listener.is_alive():
@@ -419,6 +657,24 @@ class MainApp:
                 include_trigger_box_in_ocr=bool(self.vars["include_trigger_box_in_ocr"].get()),
                 score_outline_ocr=bool(self.vars["score_outline_ocr"].get()),
                 record_import_nickname=str(self.vars["record_import_nickname"].get()).strip(),
+                overlay_backend=self.overlay_backend_from_var(),
+                python_exclusive_warning_accepted=bool(self.vars["python_exclusive_warning_accepted"].get()),
+                python_exclusive_click_through=bool(self.vars["python_exclusive_click_through"].get()),
+                python_exclusive_focus_safe=bool(self.vars["python_exclusive_focus_safe"].get()),
+                game_overlay_target_process=str(self.vars["game_overlay_target_process"].get()).strip()
+                or DEFAULT_GAME_OVERLAY_TARGET_PROCESS,
+                game_overlay_steam_app_id=int(
+                    self.vars["game_overlay_steam_app_id"].get() or DEFAULT_GAME_OVERLAY_STEAM_APP_ID
+                ),
+                game_overlay_exe_path=str(self.vars["game_overlay_exe_path"].get()).strip(),
+                game_overlay_attach_strategy=str(self.vars["game_overlay_attach_strategy"].get()).strip()
+                or DEFAULT_GAME_OVERLAY_ATTACH_STRATEGY,
+                game_overlay_warning_accepted=bool(self.vars["game_overlay_warning_accepted"].get()),
+                game_overlay_warning_version=int(self.vars["game_overlay_warning_version"].get() or 0),
+                streamer_host_enabled=bool(self.vars["streamer_host_enabled"].get()),
+                streamer_username=str(self.vars["streamer_username"].get()).strip(),
+                streamer_button=str(self.vars["streamer_button"].get()).strip(),
+                streamer_host_port=int(self.vars["streamer_host_port"].get() or DEFAULT_STREAMER_HOST_PORT),
             ),
             manual_boxes=[box.normalized() for box in self.config.manual_boxes],
         )
@@ -444,13 +700,32 @@ class MainApp:
         self.vars["include_trigger_box_in_ocr"].set(monitor.include_trigger_box_in_ocr)
         self.vars["score_outline_ocr"].set(monitor.score_outline_ocr)
         self.vars["record_import_nickname"].set(monitor.record_import_nickname)
+        self.set_overlay_backend_var(monitor.overlay_backend)
+        self.vars["python_exclusive_warning_accepted"].set(monitor.python_exclusive_warning_accepted)
+        self.vars["python_exclusive_click_through"].set(monitor.python_exclusive_click_through)
+        self.vars["python_exclusive_focus_safe"].set(monitor.python_exclusive_focus_safe)
+        self.vars["game_overlay_warning_accepted"].set(monitor.game_overlay_warning_accepted)
+        self.vars["game_overlay_warning_version"].set(getattr(monitor, "game_overlay_warning_version", 0))
+        self.vars["game_overlay_target_process"].set(monitor.game_overlay_target_process)
+        self.vars["game_overlay_steam_app_id"].set(monitor.game_overlay_steam_app_id)
+        self.vars["game_overlay_exe_path"].set(monitor.game_overlay_exe_path)
+        self.vars["game_overlay_attach_strategy"].set(monitor.game_overlay_attach_strategy)
+        self.vars["streamer_host_enabled"].set(monitor.streamer_host_enabled)
+        self.vars["streamer_username"].set(monitor.streamer_username)
+        self.vars["streamer_button"].set(monitor.streamer_button)
+        self.vars["streamer_host_port"].set(monitor.streamer_host_port)
 
     def apply_config(self, config: AppConfig) -> None:
+        self.stop_streamer_host(log=False)
         self.config = config
         self.sync_config_to_vars()
         self.load_image_from_path(config.image_path, silent=True)
         self.refresh_box_list()
         self.redraw_canvas()
+        if bool(self.vars["streamer_host_enabled"].get()):
+            self.start_streamer_host(show_errors=False)
+        else:
+            self.update_streamer_host_state()
 
     def open_image(self) -> None:
         path = filedialog.askopenfilename(
@@ -527,6 +802,202 @@ class MainApp:
         path = filedialog.askdirectory(title="저장 폴더", initialdir=str(APP_DIR))
         if path:
             self.vars["output_dir"].set(path)
+
+    def pick_game_overlay_exe_path(self) -> None:
+        path = filedialog.askopenfilename(
+            title="게임 실행 파일 선택",
+            initialdir=str(APP_DIR),
+            filetypes=[("Executable Files", "*.exe"), ("All Files", "*.*")],
+        )
+        if path:
+            self.vars["game_overlay_exe_path"].set(path)
+
+    def open_streamer_settings_window(self) -> None:
+        if self.streamer_settings_window is not None and self.streamer_settings_window.winfo_exists():
+            self.streamer_settings_window.lift()
+            self.streamer_settings_window.focus_force()
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("스트리머 설정")
+        window.resizable(False, False)
+        window.transient(self.root)
+        self.streamer_settings_window = window
+        window.protocol("WM_DELETE_WINDOW", self.close_streamer_settings_window)
+
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        row = 0
+        ttk.Checkbutton(
+            frame,
+            text="웹 호스팅 사용",
+            variable=self.vars["streamer_host_enabled"],
+            command=self.toggle_streamer_host,
+        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        row += 1
+        ttk.Label(frame, text="V-ARCHIVE 유저네임").grid(row=row, column=0, sticky="w", pady=3)
+        username_entry = ttk.Entry(frame, textvariable=self.vars["streamer_username"], width=28)
+        username_entry.grid(row=row, column=1, columnspan=2, sticky="ew", pady=3)
+        username_entry.bind("<Return>", self.on_streamer_param_committed)
+        username_entry.bind("<FocusOut>", self.on_streamer_param_committed)
+
+        row += 1
+        ttk.Label(frame, text="btn").grid(row=row, column=0, sticky="w", pady=3)
+        button_combo = ttk.Combobox(
+            frame,
+            textvariable=self.vars["streamer_button"],
+            values=list(VALID_BUTTONS),
+            state="readonly",
+            width=8,
+        )
+        button_combo.grid(row=row, column=1, sticky="w", pady=3)
+        button_combo.bind("<<ComboboxSelected>>", self.on_streamer_param_committed)
+
+        row += 1
+        ttk.Label(frame, text="포트").grid(row=row, column=0, sticky="w", pady=3)
+        port_spinbox = ttk.Spinbox(
+            frame,
+            from_=1,
+            to=65535,
+            increment=1,
+            textvariable=self.vars["streamer_host_port"],
+            width=8,
+        )
+        port_spinbox.grid(row=row, column=1, sticky="w", pady=3)
+        port_spinbox.bind("<Return>", self.on_streamer_param_committed)
+        port_spinbox.bind("<FocusOut>", self.on_streamer_param_committed)
+
+        row += 1
+        ttk.Label(frame, text="네트워크 주소").grid(row=row, column=0, sticky="w", pady=3)
+        ttk.Entry(frame, textvariable=self.vars["streamer_network_url"], state="readonly", width=54).grid(
+            row=row,
+            column=1,
+            columnspan=2,
+            sticky="ew",
+            pady=3,
+        )
+
+        row += 1
+        ttk.Label(frame, text="이 컴퓨터 주소").grid(row=row, column=0, sticky="w", pady=3)
+        ttk.Entry(frame, textvariable=self.vars["streamer_local_url"], state="readonly", width=54).grid(
+            row=row,
+            column=1,
+            columnspan=2,
+            sticky="ew",
+            pady=3,
+        )
+
+        row += 1
+        ttk.Label(frame, text="상태").grid(row=row, column=0, sticky="w", pady=3)
+        ttk.Label(frame, textvariable=self.vars["streamer_host_status"]).grid(
+            row=row,
+            column=1,
+            columnspan=2,
+            sticky="w",
+            pady=3,
+        )
+
+        row += 1
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        ttk.Button(buttons, text="시작/적용", command=lambda: self.start_streamer_host(show_errors=True)).pack(
+            side=tk.LEFT,
+            padx=(0, 6),
+        )
+        ttk.Button(buttons, text="중지", command=self.stop_streamer_host).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(buttons, text="강제 갱신", command=self.refresh_streamer_host).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(buttons, text="방화벽 허용", command=self.request_streamer_firewall_rule).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="닫기", command=self.close_streamer_settings_window).pack(side=tk.RIGHT)
+
+        frame.columnconfigure(1, weight=1)
+        self.update_streamer_host_state(check_lan=False)
+
+    def close_streamer_settings_window(self) -> None:
+        if self.streamer_settings_window is not None:
+            self.streamer_settings_window.destroy()
+            self.streamer_settings_window = None
+
+    def toggle_streamer_host(self) -> None:
+        if bool(self.vars["streamer_host_enabled"].get()):
+            self.start_streamer_host(show_errors=True)
+        else:
+            self.stop_streamer_host()
+
+    def streamer_host_params(self) -> tuple[str, str, int]:
+        username = str(self.vars["streamer_username"].get()).strip()
+        button = str(self.vars["streamer_button"].get()).strip()
+        port = int(self.vars["streamer_host_port"].get() or DEFAULT_STREAMER_HOST_PORT)
+        return username, button, port
+
+    def start_streamer_host(self, show_errors: bool = True) -> bool:
+        username, button, port = self.streamer_host_params()
+        try:
+            self.v_archive_host.start(username, button, port=port)
+        except Exception as exc:
+            self.vars["streamer_host_enabled"].set(False)
+            self.update_streamer_host_state(check_lan=False)
+            self.append_log(f"스트리머 호스팅 시작 실패: {exc}")
+            if show_errors:
+                messagebox.showerror("스트리머 호스팅 오류", str(exc))
+            return False
+
+        self.vars["streamer_host_enabled"].set(True)
+        lan_ok = self.update_streamer_host_state(check_lan=True)
+        self.append_log(f"스트리머 호스팅 시작: {self.v_archive_host.url}")
+        if not lan_ok:
+            self.append_log(
+                "네트워크 주소 접속 확인 실패. Windows 방화벽에서 TCP "
+                f"{self.v_archive_host.port} 포트를 허용하거나, 같은 PC에서는 "
+                f"{self.v_archive_host.local_url} 주소를 사용하세요."
+            )
+        return True
+
+    def stop_streamer_host(self, log: bool = True) -> None:
+        was_running = self.v_archive_host.is_running
+        self.v_archive_host.stop()
+        self.vars["streamer_host_enabled"].set(False)
+        self.update_streamer_host_state(check_lan=False)
+        if log and was_running:
+            self.append_log("스트리머 호스팅 중지")
+
+    def update_streamer_host_state(self, check_lan: bool = False) -> bool:
+        if not self.v_archive_host.is_running:
+            self.vars["streamer_network_url"].set("")
+            self.vars["streamer_local_url"].set("")
+            self.vars["streamer_host_status"].set("중지됨")
+            return False
+
+        self.vars["streamer_network_url"].set(self.v_archive_host.url)
+        self.vars["streamer_local_url"].set(self.v_archive_host.local_url)
+        lan_ok = self.v_archive_host.can_reach_lan_url() if check_lan else True
+        self.vars["streamer_host_status"].set("실행 중" if lan_ok else "실행 중(LAN 확인 실패)")
+        return lan_ok
+
+    def on_streamer_param_committed(self, _event: tk.Event | None = None) -> None:
+        if bool(self.vars["streamer_host_enabled"].get()):
+            self.start_streamer_host(show_errors=False)
+
+    def refresh_streamer_host(self) -> None:
+        if not self.v_archive_host.is_running:
+            self.append_log("스트리머 호스팅이 꺼져 있어 갱신 요청을 보내지 않았습니다.")
+            return
+        self.v_archive_host.notify_refresh()
+        self.append_log("스트리머 호스팅 강제 갱신")
+
+    def request_streamer_firewall_rule(self) -> None:
+        _username, _button, port = self.streamer_host_params()
+        command = firewall_rule_command(port)
+        if not can_request_windows_firewall_rule():
+            messagebox.showinfo("방화벽 허용", command)
+            return
+        if request_windows_firewall_rule(port):
+            self.append_log(f"방화벽 허용 요청: TCP {port}")
+            messagebox.showinfo("방화벽 허용", "관리자 권한 요청을 승인했다면 호스팅을 다시 시작하세요.")
+            return
+        self.append_log(f"방화벽 허용 요청 실패: {command}")
+        messagebox.showerror("방화벽 허용 실패", command)
 
     def start_record_import(self) -> None:
         if self.record_import_thread is not None and self.record_import_thread.is_alive():
@@ -637,10 +1108,74 @@ class MainApp:
         except Exception as exc:
             messagebox.showerror("트리거 캡처 오류", str(exc))
 
+    def start_game_overlay_backend(self, config: AppConfig) -> bool:
+        self.stop_game_overlay_backend(log_result=False)
+        if config.monitor_settings.overlay_backend != OVERLAY_BACKEND_GAME_OVERLAY_SDK:
+            return True
+        if not self.check_game_overlay_dependency():
+            self.vars["status"].set("전체화면 오버레이 fallback")
+            self.append_log("game-overlay-sdk 실패: 기존 Tk 오버레이로 fallback합니다.")
+            return True
+
+        settings = GameOverlaySettings(
+            target_process=config.monitor_settings.game_overlay_target_process,
+            steam_app_id=config.monitor_settings.game_overlay_steam_app_id,
+            exe_path=config.monitor_settings.game_overlay_exe_path,
+            attach_strategy=config.monitor_settings.game_overlay_attach_strategy,
+        )
+        if GameOverlayBackend.is_elevated():
+            backend = GameOverlayBackend(settings)
+        else:
+            if not self.ensure_game_overlay_elevation_requested():
+                self.game_overlay_backend = None
+                self.vars["status"].set("전체화면 오버레이 시작 취소")
+                self.append_log("관리자 권한 요청을 취소하여 전체화면 지원 모드를 시작하지 않았습니다.")
+                return False
+            backend = GameOverlayElevatedProxyBackend(settings)
+        result = backend.start()
+        if result.message:
+            self.append_log(result.message)
+        if result.success:
+            self.game_overlay_backend = backend
+            self.vars["status"].set("전체화면 오버레이 준비")
+            return True
+
+        self.game_overlay_backend = None
+        if result.fatal:
+            self.vars["status"].set("전체화면 오버레이 시작 실패")
+            messagebox.showwarning(
+                GAME_OVERLAY_ELEVATION_TITLE,
+                GAME_OVERLAY_ELEVATION_FAILURE_TEXT + ("\n\n" + result.message if result.message else ""),
+            )
+            return False
+
+        self.vars["status"].set("전체화면 오버레이 fallback")
+        self.append_log("game-overlay-sdk 실패: 기존 Tk 오버레이로 fallback합니다.")
+        return True
+
+    def stop_game_overlay_backend(self, log_result: bool = True) -> None:
+        self.clear_game_overlay_display(send_clear=False)
+        backend = self.game_overlay_backend
+        self.game_overlay_backend = None
+        if backend is None:
+            return
+        result = backend.stop()
+        if log_result and result.message:
+            self.append_log(result.message)
+
+    def game_overlay_launched_process(self) -> bool:
+        return bool(self.game_overlay_backend and self.game_overlay_backend.launched_process)
+
     def start_monitor(self) -> bool:
         if self.worker is not None and self.worker.is_alive():
             return True
         config = self.make_config_from_vars()
+        if config.monitor_settings.overlay_backend == OVERLAY_BACKEND_GAME_OVERLAY_SDK:
+            if not self.ensure_game_overlay_warning_accepted():
+                self.set_overlay_backend_var(OVERLAY_BACKEND_DESKTOP)
+                config = self.make_config_from_vars()
+            else:
+                config = self.make_config_from_vars()
         if not config.manual_boxes:
             messagebox.showwarning("좌표 없음", "먼저 OCR 박스를 하나 이상 지정하세요.")
             return False
@@ -656,6 +1191,8 @@ class MainApp:
             messagebox.showwarning("템플릿 없음", "트리거 템플릿 이미지를 지정하세요.")
             return False
         self.config = config
+        if not self.start_game_overlay_backend(config):
+            return False
         self.worker = MonitorWorker(config, config.manual_boxes, self.event_queue)
         self.worker.start()
         self.vars["status"].set("감시 중")
@@ -665,6 +1202,8 @@ class MainApp:
     def start_monitor_with_game(self) -> None:
         was_running = self.worker is not None and self.worker.is_alive()
         if not self.start_monitor():
+            return
+        if self.game_overlay_launched_process():
             return
         if not self.launch_steam_game() and not was_running:
             self.stop_monitor()
@@ -685,6 +1224,7 @@ class MainApp:
         if self.worker is not None:
             self.worker.stop()
             self.worker = None
+        self.stop_game_overlay_backend()
         self.vars["status"].set("중지")
         self.append_log("감시 중지 요청")
 
@@ -696,7 +1236,353 @@ class MainApp:
                 self.vars["status"].set("감시 중")
                 self.append_log("Enter 재개")
 
+    def cancel_game_overlay_timer(self) -> None:
+        if self.game_overlay_timer_job is None:
+            return
+        try:
+            self.root.after_cancel(self.game_overlay_timer_job)
+        except tk.TclError:
+            pass
+        self.game_overlay_timer_job = None
+
+    def game_overlay_frame_interval_ms(self) -> int:
+        interval = int(self.game_overlay_tick_interval_ms or monitor_frame_interval_ms(self.root))
+        return max(1, interval)
+
+    @staticmethod
+    def ease_game_overlay_animation(t: float) -> float:
+        clamped = max(0.0, min(1.0, float(t)))
+        return 1.0 - ((1.0 - clamped) ** 3)
+
+    @staticmethod
+    def game_overlay_animation_seconds() -> float:
+        return GAME_OVERLAY_ANIMATION_MS / 1000.0
+
+    def game_overlay_progress_at(self, now: float) -> float:
+        duration = max(0.001, float(self.game_overlay_duration_seconds))
+        return min(1.0, max(0.0, (now - self.game_overlay_started_at) / duration))
+
+    def schedule_next_game_overlay_tick(self) -> None:
+        self.game_overlay_timer_job = self.root.after(
+            self.game_overlay_frame_interval_ms(),
+            self.tick_game_overlay_display,
+        )
+
+    def schedule_game_overlay_timeout(self, timeout_seconds: int, callback: Any) -> None:
+        self.cancel_game_overlay_timer()
+        now = time.monotonic()
+        self.game_overlay_started_at = now
+        self.game_overlay_deadline_at = now + max(1, int(timeout_seconds))
+        self.game_overlay_animation_started_at = now
+        self.game_overlay_duration_seconds = max(1, int(timeout_seconds))
+        self.game_overlay_timeout_callback = callback
+        self.game_overlay_after_hide_callback = None
+        self.game_overlay_hide_deadline_at = None
+        self.game_overlay_last_progress = 0.0
+        self.game_overlay_current_reveal = 0.0
+        self.game_overlay_hide_start_reveal = 1.0
+        target_process = ""
+        if self.game_overlay_backend is not None:
+            target_process = self.game_overlay_backend.settings.target_process
+        self.game_overlay_tick_interval_ms = max(
+            1,
+            process_window_frame_interval_ms(target_process, self.root),
+        )
+        self.game_overlay_phase = "showing"
+        self.refresh_game_overlay_payload(0.0, reveal=0.0)
+        self.schedule_next_game_overlay_tick()
+
+    def tick_game_overlay_display(self) -> None:
+        self.game_overlay_timer_job = None
+        if not (self.game_overlay_registration_active or self.game_overlay_message_active):
+            return
+
+        now = time.monotonic()
+        animation_seconds = self.game_overlay_animation_seconds()
+        progress = self.game_overlay_progress_at(now)
+        hide_start_at = max(self.game_overlay_started_at, self.game_overlay_deadline_at - animation_seconds)
+        if self.game_overlay_phase != "hiding" and now >= hide_start_at:
+            self.game_overlay_phase = "hiding"
+            self.game_overlay_animation_started_at = hide_start_at
+            self.game_overlay_after_hide_callback = self.game_overlay_timeout_callback
+            self.game_overlay_hide_deadline_at = self.game_overlay_deadline_at
+            if hide_start_at <= self.game_overlay_started_at + animation_seconds:
+                start_reveal = self.ease_game_overlay_animation(
+                    (hide_start_at - self.game_overlay_started_at) / animation_seconds
+                )
+            else:
+                start_reveal = 1.0
+            self.game_overlay_hide_start_reveal = max(0.0, min(1.0, start_reveal))
+
+        if self.game_overlay_phase == "showing":
+            raw = (now - self.game_overlay_animation_started_at) / animation_seconds
+            reveal = self.ease_game_overlay_animation(raw)
+            self.game_overlay_current_reveal = reveal
+            self.game_overlay_last_progress = progress
+            self.refresh_game_overlay_payload(progress, reveal=reveal)
+            if raw >= 1.0:
+                self.game_overlay_phase = "visible"
+                self.game_overlay_current_reveal = 1.0
+            self.schedule_next_game_overlay_tick()
+            return
+
+        if self.game_overlay_phase == "hiding":
+            raw = (now - self.game_overlay_animation_started_at) / animation_seconds
+            reveal = self.game_overlay_hide_start_reveal * (1.0 - self.ease_game_overlay_animation(raw))
+            self.game_overlay_current_reveal = reveal
+            self.game_overlay_last_progress = progress
+            self.refresh_game_overlay_payload(progress, reveal=reveal)
+            hide_deadline = self.game_overlay_hide_deadline_at
+            if raw >= 1.0 or (hide_deadline is not None and now >= hide_deadline):
+                self.refresh_game_overlay_payload(1.0, reveal=0.0)
+                callback = self.game_overlay_after_hide_callback
+                self.game_overlay_after_hide_callback = None
+                self.game_overlay_hide_deadline_at = None
+                if callback is not None:
+                    callback()
+                else:
+                    self.clear_game_overlay_display()
+                return
+            self.schedule_next_game_overlay_tick()
+            return
+
+        self.game_overlay_last_progress = progress
+        self.game_overlay_current_reveal = 1.0
+        self.refresh_game_overlay_payload(progress, reveal=1.0)
+        if now >= hide_start_at:
+            callback = self.game_overlay_timeout_callback
+            if callback is not None:
+                self.hide_game_overlay_display(callback)
+            return
+        self.schedule_next_game_overlay_tick()
+
+    def hide_game_overlay_display(self, callback: Any | None) -> None:
+        if not (self.game_overlay_registration_active or self.game_overlay_message_active):
+            if callback is not None:
+                callback()
+            return
+        self.cancel_game_overlay_timer()
+        self.game_overlay_phase = "hiding"
+        self.game_overlay_animation_started_at = time.monotonic()
+        self.game_overlay_after_hide_callback = callback
+        self.game_overlay_hide_deadline_at = None
+        self.game_overlay_hide_start_reveal = max(0.0, min(1.0, self.game_overlay_current_reveal or 1.0))
+        self.refresh_game_overlay_payload(self.game_overlay_last_progress, reveal=self.game_overlay_hide_start_reveal)
+        self.schedule_next_game_overlay_tick()
+
+    def refresh_game_overlay_payload(self, progress: float, reveal: float = 1.0) -> None:
+        if self.game_overlay_backend is None or self.game_overlay_payload is None:
+            return
+        payload_type = self.game_overlay_payload.get("type")
+        if payload_type == "registration":
+            result = self.game_overlay_backend.show_registration_card(
+                heading=str(self.game_overlay_payload.get("heading", "")),
+                result_difficult=str(self.game_overlay_payload.get("result_difficult", "")),
+                result_button=str(self.game_overlay_payload.get("result_button", "")),
+                result_title=str(self.game_overlay_payload.get("result_title", "")),
+                result_score=str(self.game_overlay_payload.get("result_score", "")),
+                result_suffix=str(self.game_overlay_payload.get("result_suffix", "")),
+                footer=str(self.game_overlay_payload.get("footer", "")),
+                progress=progress,
+                result_score_color=str(self.game_overlay_payload.get("result_score_color", "white")),
+                reveal=reveal,
+            )
+        elif payload_type == "message":
+            result = self.game_overlay_backend.show_message_card(
+                str(self.game_overlay_payload.get("message", "")),
+                progress=progress,
+                reveal=reveal,
+            )
+        else:
+            return
+        if result.message and not result.success:
+            self.append_log(result.message)
+            self.fallback_game_overlay_display_to_desktop(progress)
+
+    def fallback_game_overlay_display_to_desktop(self, progress: float) -> None:
+        payload = dict(self.game_overlay_payload or {})
+        payload_type = payload.get("type")
+        remaining_seconds = max(
+            1,
+            round(max(0.0, 1.0 - max(0.0, min(1.0, float(progress)))) * self.game_overlay_duration_seconds),
+        )
+        self.clear_game_overlay_display()
+        self.append_log("game-overlay-sdk bitmap overlay failed; desktop overlay fallback")
+        overlay_options = self.python_exclusive_overlay_options()
+        if payload_type == "registration":
+            self.registration_overlay = RegistrationOverlay(
+                self.root,
+                heading=str(payload.get("heading", "")),
+                result_difficult=str(payload.get("result_difficult", "")),
+                result_button=str(payload.get("result_button", "")),
+                result_title=str(payload.get("result_title", "")),
+                result_score=str(payload.get("result_score", "")),
+                result_score_color=str(payload.get("result_score_color", "white")),
+                result_suffix=str(payload.get("result_suffix", "")),
+                footer=str(payload.get("footer", "")),
+                duration_seconds=remaining_seconds,
+                on_accept=self.on_overlay_accepted,
+                on_cancel=self.on_overlay_cancelled,
+                on_retry=self.on_overlay_retry,
+                on_manual=self.on_overlay_manual,
+                **overlay_options,
+            )
+            self.registration_overlay.show()
+            return
+        if payload_type == "message":
+            self.message_overlay = MessageOverlay(
+                self.root,
+                message=str(payload.get("message", "")),
+                duration_seconds=remaining_seconds,
+                on_close=self.on_message_overlay_closed,
+                **overlay_options,
+            )
+            self.message_overlay.show()
+
+    def clear_game_overlay_display(self, send_clear: bool = True) -> None:
+        self.cancel_game_overlay_timer()
+        self.game_overlay_timeout_callback = None
+        self.game_overlay_payload = None
+        self.game_overlay_phase = "hidden"
+        self.game_overlay_after_hide_callback = None
+        self.game_overlay_hide_deadline_at = None
+        self.game_overlay_deadline_at = 0.0
+        self.game_overlay_last_progress = 0.0
+        self.game_overlay_current_reveal = 0.0
+        self.game_overlay_hide_start_reveal = 1.0
+        self.game_overlay_tick_interval_ms = 0
+        self.game_overlay_registration_active = False
+        self.game_overlay_message_active = False
+        if send_clear and self.game_overlay_backend is not None:
+            result = self.game_overlay_backend.clear()
+            if result.message and not result.success:
+                self.append_log(result.message)
+
+    def show_game_registration_overlay(
+        self,
+        event: dict[str, Any],
+        timeout_seconds: int,
+        heading: str,
+        result_difficult: str,
+        result_button: str,
+        result_title: str,
+        result_score: str,
+        result_suffix: str,
+        result_score_color: str,
+        footer: str,
+    ) -> bool:
+        if self.overlay_backend_from_var() != OVERLAY_BACKEND_GAME_OVERLAY_SDK:
+            return False
+        if self.game_overlay_backend is None:
+            return False
+        self.game_overlay_payload = {
+            "type": "registration",
+            "heading": heading,
+            "result_difficult": result_difficult,
+            "result_button": result_button,
+            "result_title": result_title,
+            "result_score": result_score,
+            "result_suffix": result_suffix,
+            "result_score_color": result_score_color,
+            "footer": footer,
+        }
+        result = self.game_overlay_backend.show_registration_card(
+            heading=heading,
+            result_difficult=result_difficult,
+            result_button=result_button,
+            result_title=result_title,
+            result_score=result_score,
+            result_suffix=result_suffix,
+            footer=footer,
+            progress=0.0,
+            result_score_color=result_score_color,
+            reveal=0.0,
+        )
+        if not result.success:
+            self.game_overlay_payload = None
+            self.append_log(result.message)
+            return False
+        self.game_overlay_registration_active = True
+        self.game_overlay_message_active = False
+        self.schedule_game_overlay_timeout(timeout_seconds, self.finish_game_overlay_registration_accept)
+        self.append_log("game-overlay-sdk 등록 오버레이 표시")
+        return True
+
+    def show_game_message_overlay(self, message: str, timeout_seconds: int) -> bool:
+        if self.overlay_backend_from_var() != OVERLAY_BACKEND_GAME_OVERLAY_SDK:
+            return False
+        if self.game_overlay_backend is None:
+            return False
+        self.game_overlay_payload = {
+            "type": "message",
+            "message": message,
+        }
+        result = self.game_overlay_backend.show_message_card(message, 0.0, reveal=0.0)
+        if not result.success:
+            self.game_overlay_payload = None
+            self.append_log(result.message)
+            return False
+        self.game_overlay_message_active = True
+        self.game_overlay_registration_active = False
+        self.schedule_game_overlay_timeout(timeout_seconds, self.finish_game_overlay_message_close)
+        self.append_log("game-overlay-sdk 메시지 오버레이 표시")
+        return True
+
+    def accept_game_overlay_registration(self) -> None:
+        if not self.game_overlay_registration_active:
+            self.resume_monitor()
+            return
+        self.hide_game_overlay_display(self.finish_game_overlay_registration_accept)
+
+    def finish_game_overlay_registration_accept(self) -> None:
+        self.clear_game_overlay_display()
+        self.on_overlay_accepted()
+
+    def cancel_game_overlay_registration(self) -> None:
+        if not self.game_overlay_registration_active:
+            return
+        self.hide_game_overlay_display(self.finish_game_overlay_registration_cancel)
+
+    def finish_game_overlay_registration_cancel(self) -> None:
+        self.clear_game_overlay_display()
+        self.on_overlay_cancelled()
+
+    def retry_game_overlay_registration(self) -> None:
+        if not self.game_overlay_registration_active:
+            return
+        self.hide_game_overlay_display(self.finish_game_overlay_registration_retry)
+
+    def finish_game_overlay_registration_retry(self) -> None:
+        self.clear_game_overlay_display()
+        self.on_overlay_retry()
+
+    def manual_game_overlay_registration(self) -> None:
+        if not self.game_overlay_registration_active:
+            return
+        self.hide_game_overlay_display(self.finish_game_overlay_registration_manual)
+
+    def finish_game_overlay_registration_manual(self) -> None:
+        self.clear_game_overlay_display()
+        self.on_overlay_manual()
+
+    def close_game_overlay_message(self, resume_on_close: bool | None = None) -> None:
+        if not self.game_overlay_message_active:
+            return
+        if resume_on_close is not None:
+            self.message_overlay_resume_on_close = resume_on_close
+        self.hide_game_overlay_display(self.finish_game_overlay_message_close)
+
+    def finish_game_overlay_message_close(self) -> None:
+        self.clear_game_overlay_display()
+        self.on_message_overlay_closed()
+
     def handle_enter_key(self) -> None:
+        if self.game_overlay_registration_active:
+            self.accept_game_overlay_registration()
+            return
+        if self.game_overlay_message_active:
+            self.close_game_overlay_message(resume_on_close=True)
+            return
         if self.registration_overlay is not None:
             self.accept_registration_overlay(source="enter")
             return
@@ -708,14 +1594,23 @@ class MainApp:
         self.resume_monitor()
 
     def handle_delete_key(self) -> None:
+        if self.game_overlay_registration_active:
+            self.cancel_game_overlay_registration()
+            return
         if self.registration_overlay is not None:
             self.cancel_registration_overlay()
 
     def handle_insert_key(self) -> None:
+        if self.game_overlay_registration_active:
+            self.retry_game_overlay_registration()
+            return
         if self.registration_overlay is not None:
             self.retry_registration_overlay()
 
     def handle_manual_overlay_key(self) -> None:
+        if self.game_overlay_registration_active:
+            self.manual_game_overlay_registration()
+            return
         self.request_manual_overlay_input()
 
     def accept_registration_overlay(self, source: str = "manual") -> None:
@@ -950,6 +1845,7 @@ class MainApp:
         if self.registration_overlay is not None:
             self.registration_overlay.close_now()
             self.registration_overlay = None
+        self.clear_game_overlay_display()
         self.current_overlay_event = event
 
         results = event.get("results", [])
@@ -973,6 +1869,22 @@ class MainApp:
             "직접 입력하려면 \"=\" 키를 눌러주세요."
         )
         timeout_seconds = int(self.vars["overlay_timeout_seconds"].get())
+        if self.show_game_registration_overlay(
+            event,
+            timeout_seconds,
+            heading=heading,
+            result_difficult=difficult,
+            result_button=button,
+            result_title=title,
+            result_score=score,
+            result_suffix=score_suffix,
+            result_score_color=score_color,
+            footer=footer,
+        ):
+            return
+        overlay_options = self.python_exclusive_overlay_options()
+        if overlay_options["exclusive_compat"]:
+            self.append_log(PYTHON_EXCLUSIVE_WARNING_LOG)
         self.registration_overlay = RegistrationOverlay(
             self.root,
             heading=heading,
@@ -988,6 +1900,7 @@ class MainApp:
             on_cancel=self.on_overlay_cancelled,
             on_retry=self.on_overlay_retry,
             on_manual=self.on_overlay_manual,
+            **overlay_options,
         )
         self.registration_overlay.show()
 
@@ -1040,15 +1953,22 @@ class MainApp:
             overlay = self.message_overlay
             self.message_overlay = None
             overlay.close_now()
+        self.clear_game_overlay_display()
         self.current_overlay_event = event
         self.message_overlay_close_log = log_message or message
         self.message_overlay_resume_on_close = resume_on_close
         timeout_seconds = int(self.vars["message_overlay_timeout_seconds"].get())
+        if self.show_game_message_overlay(message, timeout_seconds):
+            return
+        overlay_options = self.python_exclusive_overlay_options()
+        if overlay_options["exclusive_compat"]:
+            self.append_log(PYTHON_EXCLUSIVE_WARNING_LOG)
         self.message_overlay = MessageOverlay(
             self.root,
             message=message,
             duration_seconds=timeout_seconds,
             on_close=self.on_message_overlay_closed,
+            **overlay_options,
         )
         self.message_overlay.show()
 
@@ -1072,6 +1992,9 @@ class MainApp:
                 self.append_log(f"기록 저장 오류: {exc}")
                 self.show_message_overlay(None, message=f"기록 저장 오류: {exc}", log_message=f"기록 저장 오류: {exc}")
                 return
+            if result.update is True and self.v_archive_host.is_running:
+                self.v_archive_host.notify_refresh()
+                self.append_log("스트리머 호스팅 기록 갱신")
             if result.message:
                 self.show_message_overlay(None, message=result.message, log_message=result.message)
                 return
@@ -1695,6 +2618,10 @@ class MainApp:
         if self.message_overlay is not None:
             self.message_overlay.close_now()
             self.message_overlay = None
+        if self.streamer_settings_window is not None:
+            self.streamer_settings_window.destroy()
+            self.streamer_settings_window = None
+        self.stop_streamer_host(log=False)
         self.stop_monitor()
         if self.global_enter_listener is not None:
             self.global_enter_listener.stop()

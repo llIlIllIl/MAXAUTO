@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import sys
 from typing import Any
 
@@ -39,9 +40,121 @@ def monitor_frame_interval_ms(widget: Any | None = None, default_refresh_rate: i
     return max(1, round(1000 / refresh_rate))
 
 
+def process_window_frame_interval_ms(
+    process_name: str,
+    fallback_widget: Any | None = None,
+    default_refresh_rate: int = 60,
+) -> int:
+    refresh_rate = max(1, get_process_window_refresh_rate(process_name, fallback_widget, default_refresh_rate))
+    return max(1, round(1000 / refresh_rate))
+
+
+def get_process_window_refresh_rate(
+    process_name: str,
+    fallback_widget: Any | None = None,
+    default: int = 60,
+) -> int:
+    if sys.platform != "win32":
+        return default
+    try:
+        point = _process_window_center(process_name)
+        if point is not None:
+            return _win32_refresh_rate_at_point(point[0], point[1], default)
+    except Exception:
+        pass
+    return get_monitor_refresh_rate(fallback_widget, default)
+
+
 def _widget_center(widget: Any | None) -> tuple[int, int]:
     if widget is None:
         return 0, 0
+
+
+def _process_window_center(process_name: str) -> tuple[int, int] | None:
+    target_name = os.path.basename(str(process_name or "").replace("/", "\\")).strip().lower()
+    if not target_name:
+        return None
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    user32.EnumWindows.argtypes = [WNDENUMPROC, ctypes.c_void_p]
+    user32.EnumWindows.restype = ctypes.c_bool
+    user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+    user32.IsWindowVisible.restype = ctypes.c_bool
+    user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    user32.GetWindowThreadProcessId.restype = ctypes.c_ulong
+    user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(RECT)]
+    user32.GetWindowRect.restype = ctypes.c_bool
+    kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_bool, ctypes.c_ulong]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_wchar_p,
+        ctypes.POINTER(ctypes.c_ulong),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = ctypes.c_bool
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_bool
+
+    windows: list[tuple[int, int, int]] = []
+    process_names: dict[int, str] = {}
+
+    def process_basename(pid: int) -> str:
+        if pid in process_names:
+            return process_names[pid]
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            process_names[pid] = ""
+            return ""
+        try:
+            size = ctypes.c_ulong(32768)
+            buffer = ctypes.create_unicode_buffer(size.value)
+            if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                process_names[pid] = ""
+                return ""
+            process_names[pid] = os.path.basename(buffer.value).lower()
+            return process_names[pid]
+        finally:
+            kernel32.CloseHandle(handle)
+
+    def enum_window(hwnd: int, _param: int) -> bool:
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        pid = ctypes.c_ulong(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if process_basename(int(pid.value)) != target_name:
+            return True
+        rect = RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return True
+        width = int(rect.right - rect.left)
+        height = int(rect.bottom - rect.top)
+        if width <= 1 or height <= 1:
+            return True
+        area = width * height
+        center_x = int(rect.left + (width // 2))
+        center_y = int(rect.top + (height // 2))
+        windows.append((area, center_x, center_y))
+        return True
+
+    callback = WNDENUMPROC(enum_window)
+    user32.EnumWindows(callback, 0)
+    if not windows:
+        return None
+    _area, x, y = max(windows, key=lambda item: item[0])
+    return x, y
     try:
         widget.update_idletasks()
         width = max(1, int(widget.winfo_width()))

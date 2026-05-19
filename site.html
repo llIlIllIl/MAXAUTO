@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="ko">
+
+<head>
+    <meta charset="UTF-8">
+    <title>MAXOCR Streamer Overlay</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@700;900&display=swap');
+
+        :root {
+            --panel-bg: rgba(18, 20, 28, 0.86);
+            --panel-line: rgba(255, 255, 255, 0.16);
+            --text-main: #ffffff;
+            --text-soft: #b9c7d9;
+            --accent: #49f0b4;
+            --accent-warm: #ffd35c;
+            --danger: #ff6a6a;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            margin: 0;
+            padding: 0;
+            background: transparent;
+            overflow: hidden;
+            font-family: 'Noto Sans KR', sans-serif;
+            color: var(--text-main);
+        }
+
+        body {
+            padding: 12px;
+        }
+
+        .overlay {
+            --progress: 0deg;
+            display: inline-flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: space-between;
+            width: 280px;
+            height: 300px;
+            gap: 10px;
+            align-items: center;
+            padding: 16px;
+            border: 1px solid var(--panel-line);
+            border-radius: 6px;
+            background: var(--panel-bg);
+            box-shadow: 0 10px 26px rgba(0, 0, 0, 0.42);
+            text-shadow: 0 2px 4px rgba(0, 0, 0, 0.65);
+        }
+
+        .player {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+            min-width: 0;
+            gap: 10px;
+        }
+
+        .button {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            flex: 0 0 auto;
+            min-width: 46px;
+            height: 34px;
+            padding: 0 10px;
+            border-radius: 17px;
+            background: rgba(255, 211, 92, 0.18);
+            border: 2px solid var(--accent-warm);
+            color: var(--accent-warm);
+            font-size: 17px;
+            font-weight: 900;
+        }
+
+        .name {
+            min-width: 0;
+            max-width: 180px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-size: 23px;
+            font-weight: 900;
+            line-height: 1.05;
+        }
+
+        .class {
+            width: 100%;
+            max-width: 248px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            text-align: center;
+            color: var(--accent);
+            font-size: 22px;
+            font-weight: 900;
+            line-height: 1.05;
+        }
+
+        .progress-wrap {
+            position: relative;
+            width: 158px;
+            height: 158px;
+            flex: 0 0 auto;
+            border-radius: 50%;
+            background:
+                radial-gradient(circle at center, rgba(18, 20, 28, 0.96) 0 58%, transparent 59%),
+                conic-gradient(var(--accent) var(--progress), rgba(255, 255, 255, 0.14) 0);
+            box-shadow:
+                inset 0 0 0 1px rgba(255, 255, 255, 0.10),
+                0 8px 20px rgba(0, 0, 0, 0.26);
+            transition: background 650ms ease-out;
+        }
+
+        .progress-wrap::after {
+            content: "";
+            position: absolute;
+            inset: 13px;
+            border-radius: 50%;
+            border: 1px solid rgba(255, 255, 255, 0.10);
+        }
+
+        .progress-center {
+            position: absolute;
+            inset: 32px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 3px;
+            min-width: 0;
+            text-align: center;
+        }
+
+        .label {
+            display: block;
+            width: 100%;
+            max-width: 100%;
+            overflow: hidden;
+            white-space: nowrap;
+            color: var(--text-soft);
+            font-size: 13px;
+            font-weight: 700;
+            line-height: 1;
+        }
+
+        .power {
+            display: block;
+            width: 100%;
+            max-width: 100%;
+            overflow: hidden;
+            white-space: nowrap;
+            font-size: 29px;
+            font-weight: 900;
+            line-height: 1;
+        }
+
+        .percent {
+            display: block;
+            width: 100%;
+            max-width: 100%;
+            overflow: hidden;
+            white-space: nowrap;
+            color: var(--accent-warm);
+            font-size: 15px;
+            font-weight: 900;
+            line-height: 1;
+        }
+
+        .next {
+            width: 100%;
+            max-width: 248px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            text-align: center;
+            color: var(--text-soft);
+            font-size: 14px;
+            font-weight: 700;
+        }
+
+        .overlay.is-error .class,
+        .overlay.is-error .power,
+        .overlay.is-error .percent {
+            color: var(--danger);
+        }
+
+        .overlay.is-error .progress-wrap {
+            background:
+                radial-gradient(circle at center, rgba(18, 20, 28, 0.96) 0 58%, transparent 59%),
+                conic-gradient(var(--danger) var(--progress), rgba(255, 255, 255, 0.14) 0);
+        }
+
+        .progress-wrap.progress-gain {
+            animation: progress-gain 850ms ease-out;
+        }
+
+        .progress-wrap.progress-gain::before {
+            content: "";
+            position: absolute;
+            inset: -8px;
+            border-radius: 50%;
+            background: conic-gradient(transparent 0deg, rgba(73, 240, 180, 0.0) var(--previous-progress), rgba(73, 240, 180, 0.9) var(--previous-progress), rgba(255, 211, 92, 0.9) var(--progress), transparent var(--progress));
+            filter: blur(8px);
+            opacity: 0;
+            animation: progress-sweep 850ms ease-out;
+            pointer-events: none;
+        }
+
+        .progress-wrap.progress-gain .percent {
+            animation: percent-pop 650ms ease-out;
+        }
+
+        .overlay.flash {
+            animation: refresh-flash 900ms ease-out;
+        }
+
+        @keyframes progress-gain {
+            0% {
+                transform: scale(1);
+            }
+
+            28% {
+                transform: scale(1.045);
+            }
+
+            100% {
+                transform: scale(1);
+            }
+        }
+
+        @keyframes progress-sweep {
+            0% {
+                opacity: 0;
+                transform: rotate(-8deg) scale(0.96);
+            }
+
+            20% {
+                opacity: 1;
+            }
+
+            100% {
+                opacity: 0;
+                transform: rotate(6deg) scale(1.08);
+            }
+        }
+
+        @keyframes percent-pop {
+            0% {
+                transform: translateY(0);
+                color: var(--accent-warm);
+            }
+
+            35% {
+                transform: translateY(-3px);
+                color: var(--accent);
+            }
+
+            100% {
+                transform: translateY(0);
+                color: var(--accent-warm);
+            }
+        }
+
+        @keyframes refresh-flash {
+            0% {
+                transform: translateX(0);
+                box-shadow: 0 10px 26px rgba(0, 0, 0, 0.42);
+            }
+
+            20% {
+                transform: scale(1.025);
+                box-shadow:
+                    0 0 18px rgba(73, 240, 180, 0.85),
+                    0 10px 26px rgba(0, 0, 0, 0.42);
+            }
+
+            100% {
+                transform: scale(1);
+                box-shadow: 0 10px 26px rgba(0, 0, 0, 0.42);
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <main id="overlay" class="overlay">
+        <section class="player">
+            <span id="button-badge" class="button">-</span>
+            <span id="nickname-text" class="name">Loading...</span>
+        </section>
+        <section id="progress-wrap" class="progress-wrap" aria-hidden="true">
+            <div class="progress-center">
+                <span class="label">POWER</span>
+                <span id="power-display" class="power">-</span>
+                <span id="progress-percent" class="percent">0%</span>
+            </div>
+        </section>
+        <section id="class-display" class="class">-</section>
+        <section id="next-display" class="next">NEXT - / TARGET -</section>
+    </main>
+
+    <script>
+        const DJCLASS = {
+            emblems: ['BEGINNER', 'TRAINEE', 'AMATEUR', 'ROOKIE', 'STREET DJ', 'MIDDLEMAN', 'PRO DJ', 'HIGH CLASS', 'PROFESSIONAL',
+                'TREND SETTER', 'HEADLINER', 'SHOWSTOPPER', 'BEAT MAESTRO', 'THE LORD OF DJMAX'],
+            tierSeparators: ['IV', 'III', 'II', 'I'],
+            borders: [[0, 0, 0, 0],
+            [500, 1000, 1500, 2000],
+            [2400, 2800, 3200, 3600],
+            [4000, 4300, 4600, 4900],
+            [5200, 5500, 5800, 6000],
+            [6200, 6400, 6600, 6800],
+            [7000, 7200, 7400, 7600],
+            [7800, 8000, 8200, 8400],
+            [8600, 8700, 8800, 8900],
+            [9000, 9100, 9200, 9300],
+            [9400, 9500, 9600, 9650],
+            [9700, 9750, 9800, 9850],
+            [9900, 9930, 9950, 9970],
+            [9980, 9980, 9980, 9980]]
+        };
+
+        const PARAMS = new URLSearchParams(window.location.search);
+        const NICKNAME = (PARAMS.get('u') || '').trim();
+        const BUTTON = (PARAMS.get('btn') || '').trim();
+        const VALID_BUTTONS = new Set(['4', '5', '6', '8']);
+        const CAN_RUN = NICKNAME.length > 0 && VALID_BUTTONS.has(BUTTON);
+        const overlay = document.getElementById('overlay');
+        const progressWrap = document.getElementById('progress-wrap');
+        const fittedText = [
+            { element: document.getElementById('nickname-text'), maxSize: 23, minSize: 12 },
+            { element: document.getElementById('class-display'), maxSize: 22, minSize: 11 },
+            { element: document.getElementById('next-display'), maxSize: 14, minSize: 10 },
+            { element: document.querySelector('.label'), maxSize: 13, minSize: 9 },
+            { element: document.getElementById('power-display'), maxSize: 29, minSize: 13 },
+            { element: document.getElementById('progress-percent'), maxSize: 15, minSize: 9 }
+        ];
+        let lastPower = null;
+        let lastPercent = null;
+
+        function fitText(element, maxSize, minSize) {
+            if (!element) return;
+            element.style.fontSize = `${maxSize}px`;
+            let size = maxSize;
+            while (size > minSize && element.scrollWidth > element.clientWidth) {
+                size -= 1;
+                element.style.fontSize = `${size}px`;
+            }
+        }
+
+        function fitAllText() {
+            requestAnimationFrame(() => {
+                for (const item of fittedText) {
+                    fitText(item.element, item.maxSize, item.minSize);
+                }
+            });
+        }
+
+        function setStatus(message, isError = true) {
+            overlay.classList.toggle('is-error', isError);
+            document.getElementById('nickname-text').innerText = message;
+            document.getElementById('button-badge').innerText = '-';
+            document.getElementById('class-display').innerText = '-';
+            document.getElementById('power-display').innerText = '-';
+            document.getElementById('progress-percent').innerText = '0%';
+            document.getElementById('next-display').innerText = 'NEXT - / TARGET -';
+            overlay.style.setProperty('--progress', '0deg');
+            overlay.style.setProperty('--previous-progress', '0deg');
+            lastPercent = null;
+            fitAllText();
+        }
+
+        function splitClassName(className) {
+            if (className === 'BEGINNER') return ['BEGINNER', 'I'];
+            const lastSpace = className.lastIndexOf(' ');
+            if (lastSpace < 0) return [className, ''];
+            return [className.slice(0, lastSpace), className.slice(lastSpace + 1)];
+        }
+
+        function nextClassInfo(className) {
+            if (className === 'THE LORD OF DJMAX') {
+                return { label: '-', border: null };
+            }
+            const [emblem, tier] = splitClassName(className);
+            const tierIndex = DJCLASS.tierSeparators.indexOf(tier);
+            const emblemIndex = DJCLASS.emblems.indexOf(emblem);
+            if (tierIndex < 0 || emblemIndex < 0) {
+                return { label: '-', border: null };
+            }
+            const next = tier === 'I'
+                ? [DJCLASS.emblems[emblemIndex + 1], 'IV']
+                : [emblem, DJCLASS.tierSeparators[tierIndex + 1]];
+            const nextEmblemIndex = DJCLASS.emblems.indexOf(next[0]);
+            const nextTierIndex = DJCLASS.tierSeparators.indexOf(next[1]);
+            const border = next[0] === 'THE LORD OF DJMAX'
+                ? DJCLASS.borders[nextEmblemIndex][0]
+                : DJCLASS.borders[nextEmblemIndex][nextTierIndex];
+            return { label: `${next[0]} ${next[1]}`.trim(), border };
+        }
+
+        function currentClassFloor(className) {
+            if (className === 'THE LORD OF DJMAX') return 9980;
+            const [emblem, tier] = splitClassName(className);
+            const tierIndex = DJCLASS.tierSeparators.indexOf(tier);
+            const emblemIndex = DJCLASS.emblems.indexOf(emblem);
+            if (tierIndex < 0 || emblemIndex < 0) return 0;
+            if (emblem === 'BEGINNER') return 0;
+            const previousTierIndex = tierIndex > 0 ? tierIndex - 1 : 3;
+            const previousEmblemIndex = tierIndex > 0 ? emblemIndex : emblemIndex - 1;
+            if (previousEmblemIndex < 0) return 0;
+            return DJCLASS.borders[previousEmblemIndex][previousTierIndex];
+        }
+
+        function progressPercent(power, className, nextBorder) {
+            if (!Number.isFinite(power)) return 0;
+            if (!Number.isFinite(nextBorder)) return 100;
+            const floor = currentClassFloor(className);
+            const span = Math.max(1, nextBorder - floor);
+            return Math.max(0, Math.min(100, ((power - floor) / span) * 100));
+        }
+
+        function flash() {
+            overlay.classList.remove('flash');
+            void overlay.offsetWidth;
+            overlay.classList.add('flash');
+        }
+
+        function animateProgressGain(previousPercent, currentPercent) {
+            if (!Number.isFinite(previousPercent) || currentPercent <= previousPercent) return;
+            overlay.style.setProperty('--previous-progress', `${previousPercent * 3.6}deg`);
+            progressWrap.classList.remove('progress-gain');
+            void progressWrap.offsetWidth;
+            progressWrap.classList.add('progress-gain');
+        }
+
+        async function updateStats() {
+            if (!CAN_RUN) return;
+            const url = `/api/dj-class?u=${encodeURIComponent(NICKNAME)}&btn=${encodeURIComponent(BUTTON)}`;
+            try {
+                const response = await fetch(url);
+                const data = await response.json();
+                if (!data.success) {
+                    setStatus('DATA NOT FOUND');
+                    return;
+                }
+
+                const currentPower = parseFloat(data.djPowerConversion);
+                const next = nextClassInfo(data.djClass);
+                overlay.classList.remove('is-error');
+                document.getElementById('nickname-text').innerText = NICKNAME;
+                document.getElementById('button-badge').innerText = `${BUTTON}B`;
+                document.getElementById('class-display').innerText = data.djClass;
+                document.getElementById('power-display').innerText = Number.isFinite(currentPower) ? currentPower.toFixed(4) : '-';
+                const percent = progressPercent(currentPower, data.djClass, next.border);
+                animateProgressGain(lastPercent, percent);
+                overlay.style.setProperty('--progress', `${percent * 3.6}deg`);
+                document.getElementById('progress-percent').innerText = `${Math.round(percent)}%`;
+                document.getElementById('next-display').innerText =
+                    `NEXT ${next.label} / TARGET ${Number.isFinite(next.border) ? Number(next.border).toFixed(4) : '-'}`;
+                fitAllText();
+
+                if (lastPower !== null && Number.isFinite(currentPower) && currentPower > lastPower) {
+                    flash();
+                }
+                lastPower = Number.isFinite(currentPower) ? currentPower : lastPower;
+                lastPercent = Number.isFinite(percent) ? percent : lastPercent;
+            } catch (error) {
+                console.error('Overlay API error:', error);
+                setStatus('CONN ERROR');
+            }
+        }
+
+        function connectRefreshEvents() {
+            if (!window.EventSource) return;
+            const events = new EventSource('/events');
+            events.addEventListener('refresh', updateStats);
+            events.onerror = () => {
+                console.warn('MAXOCR event stream disconnected.');
+            };
+        }
+
+        if (CAN_RUN) {
+            document.getElementById('nickname-text').innerText = NICKNAME;
+            document.getElementById('button-badge').innerText = `${BUTTON}B`;
+            fitAllText();
+            updateStats();
+            connectRefreshEvents();
+        } else {
+            setStatus('PARAM REQUIRED');
+        }
+
+        window.addEventListener('resize', fitAllText);
+    </script>
+</body>
+
+</html>
